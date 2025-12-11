@@ -71,6 +71,21 @@ function getApiKey(extra: { authInfo?: AuthInfo }): string {
   return extra.authInfo.token;
 }
 
+// Validate that the provided token is a valid Workflowy API key
+async function validateWorkflowyToken(apiKey: string): Promise<void> {
+  const res = await fetch("https://workflowy.com/api/v1/targets", {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error("Invalid Workflowy API key");
+  }
+}
+
 const handler = createMcpHandler(
   (server) => {
     // ==================== BOOKMARK TOOLS ====================
@@ -86,7 +101,8 @@ const handler = createMcpHandler(
           ),
         node_id: z.string().describe("The Workflowy node UUID to bookmark"),
       },
-      async ({ name, node_id }: { name: string; node_id: string }) => {
+      async ({ name, node_id }: { name: string; node_id: string }, extra) => {
+        await validateWorkflowyToken(getApiKey(extra));
         const sql = await getDb();
         await sql`
           INSERT INTO bookmarks (name, node_id)
@@ -108,7 +124,8 @@ const handler = createMcpHandler(
       "list_bookmarks",
       "List all saved Workflowy bookmarks. Use this to see what locations have been bookmarked.",
       {},
-      async () => {
+      async (_args, extra) => {
+        await validateWorkflowyToken(getApiKey(extra));
         const sql = await getDb();
         const result =
           await sql`SELECT name, node_id, created_at FROM bookmarks ORDER BY name`;
@@ -124,7 +141,8 @@ const handler = createMcpHandler(
       {
         name: z.string().describe("The bookmark name to delete"),
       },
-      async ({ name }: { name: string }) => {
+      async ({ name }: { name: string }, extra) => {
+        await validateWorkflowyToken(getApiKey(extra));
         const sql = await getDb();
         const result =
           await sql`DELETE FROM bookmarks WHERE name = ${name} RETURNING name`;
