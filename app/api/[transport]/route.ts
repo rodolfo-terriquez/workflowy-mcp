@@ -464,4 +464,22 @@ async function handleGet(_req: Request): Promise<Response> {
   );
 }
 
-export { handleGet as GET, handleRequest as POST };
+// Handle DELETE requests - return method not allowed but with proper JSON
+async function handleDelete(_req: Request): Promise<Response> {
+  return new Response(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      error: {
+        code: -32601,
+        message: "DELETE method not supported. Use POST for MCP protocol.",
+      },
+      id: null,
+    }),
+    {
+      status: 200, // Return 200 to avoid triggering OAuth flow
+      headers: { "Content-Type": "application/json" },
+    }
+  );
+}
+
+export { handleGet as GET, handleRequest as POST, handleDelete as DELETE };
