@@ -1,7 +1,3 @@
 {
-  "functions": {
-    "app/api/[transport]/route.ts": {
-      "maxDuration": 60
-    }
-  }
+  "framework": "nextjs"
 }
