@@ -173,37 +173,6 @@ const handler = createMcpHandler(
       },
     );
 
-    // ==================== DEBUG TOOL ====================
-
-    server.tool(
-      "debug_auth",
-      "Debug tool to check authentication status",
-      {},
-      async (_args, extra) => {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  hasExtra: !!extra,
-                  hasAuthInfo: !!extra?.authInfo,
-                  authInfoKeys: extra?.authInfo
-                    ? Object.keys(extra.authInfo)
-                    : [],
-                  token: extra?.authInfo?.token
-                    ? "present (hidden)"
-                    : "missing",
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      },
-    );
-
     // ==================== WORKFLOWY READ TOOLS ====================
 
     server.tool(

@@ -14,8 +14,8 @@
                 background-color: #000;
                 color: #fff;
                 font-family:
-                    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
-                    sans-serif;
+                    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                    Helvetica, Arial, sans-serif;
                 min-height: 100vh;
                 display: flex;
                 flex-direction: column;
@@ -24,33 +24,109 @@
                 padding: 2rem;
             }
             h1 {
-                font-size: 4rem;
+                font-size: 3rem;
                 font-weight: 700;
-                margin-bottom: 1.5rem;
-            }
-            p {
-                font-size: 1.5rem;
-                color: #999;
                 margin-bottom: 1rem;
             }
-            a {
+            .subtitle {
+                font-size: 1.25rem;
+                color: #999;
+                margin-bottom: 2rem;
+            }
+            .card {
+                background: #111;
+                border: 1px solid #333;
+                border-radius: 8px;
+                padding: 1.5rem;
+                max-width: 600px;
+                width: 100%;
+                margin-bottom: 1.5rem;
+            }
+            .card h2 {
+                font-size: 1.1rem;
+                margin-bottom: 1rem;
                 color: #fff;
-                text-decoration: underline;
+            }
+            .card p {
+                font-size: 0.95rem;
+                color: #999;
+                line-height: 1.6;
+                margin-bottom: 0.75rem;
+            }
+            .card code {
+                background: #222;
+                padding: 0.2rem 0.4rem;
+                border-radius: 4px;
+                font-family: monospace;
+                font-size: 0.9rem;
+                color: #0ff;
+            }
+            .card pre {
+                background: #1a1a1a;
+                padding: 1rem;
+                border-radius: 4px;
+                overflow-x: auto;
+                font-size: 0.85rem;
+                line-height: 1.5;
+                margin-top: 0.5rem;
+            }
+            a {
+                color: #0ff;
+                text-decoration: none;
             }
             a:hover {
-                color: #ccc;
+                text-decoration: underline;
             }
             .github {
-                font-size: 1.25rem;
+                font-size: 1rem;
                 color: #666;
             }
         </style>
     </head>
     <body>
         <h1>Workflowy MCP</h1>
-        <p>Run your own MCP server to connect to <a href="https://workflowy.com">Workflowy</a>.</p>
+        <p class="subtitle">
+            An MCP server for connecting AI assistants to your Workflowy account
+        </p>
+
+        <div class="card">
+            <h2>How to Connect</h2>
+            <p>
+                This is an MCP (Model Context Protocol) server. To use it,
+                configure your MCP client with:
+            </p>
+            <p><strong>URL:</strong> <code>/api/mcp</code></p>
+            <p>
+                <strong>Header:</strong>
+                <code>Authorization: Bearer YOUR_WORKFLOWY_API_KEY</code>
+            </p>
+            <p>
+                Get your API key from
+                <a href="https://workflowy.com/api/">workflowy.com/api</a>
+            </p>
+        </div>
+
+        <div class="card">
+            <h2>Example Configuration</h2>
+            <p>For Claude Code (<code>.claude/mcp.json</code>):</p>
+            <pre>
+{
+  "mcpServers": {
+    "workflowy": {
+      "url": "https://your-app.vercel.app/api/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_API_KEY"
+      }
+    }
+  }
+}</pre
+            >
+        </div>
+
         <p class="github">
-            <a href="https://github.com/rodolfo-terriquez/workflowy-mcp">View on GitHub</a>
+            <a href="https://github.com/rodolfo-terriquez/workflowy-mcp"
+                >View setup instructions on GitHub</a
+            >
         </p>
     </body>
 </html>
