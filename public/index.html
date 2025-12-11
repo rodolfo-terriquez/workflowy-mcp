@@ -110,14 +110,19 @@
 
         <div class="card">
             <h2>Example Configuration</h2>
-            <p>For Claude Code (<code>.claude/mcp.json</code>):</p>
+            <p>For Claude Code (<code>~/.claude.json</code>):</p>
             <pre>
 {
-  "mcpServers": {
-    "workflowy": {
-      "url": "https://your-app.vercel.app/api/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_API_KEY"
+  "projects": {
+    "/path/to/your/project": {
+      "mcpServers": {
+        "workflowy": {
+          "type": "streamable-http",
+          "url": "https://workflowy-mcp.vercel.app/api/mcp",
+          "headers": {
+            "Authorization": "Bearer YOUR_WORKFLOWY_API_KEY"
+          }
+        }
       }
     }
   }

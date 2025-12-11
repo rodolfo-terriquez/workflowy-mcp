@@ -22,23 +22,31 @@ An MCP (Model Context Protocol) server that connects AI assistants to your Workf
 2. Generate or copy your API key
 3. Keep this key secure—you'll use it to authenticate with the MCP server
 
-### 3. Connect to [Cherry Studio](https://www.cherry-ai.com/) (Optional)
-You can use your MCP server anywhere you want but this is an easy way to connect to it.
+### 3. Connect to Claude Code
 
-1. Open Cherry Studio
-2. Go to **Settings** > **MCP Servers**
-3. Click **Add Server**
-4. Configure the server:
-   - **Name**: Workflowy (or any name you prefer)
-   - **Type**: Streamable HTTP
-   - **URL**: `https://your-vercel-app.vercel.app/api/mcp`
-   - **Headers**: Add an Authorization header:
-     ```
-     Authorization: Bearer <your-workflowy-api-key>
-     ```
-5. Click **Save**
+Add the MCP server to your Claude Code configuration in `~/.claude.json`, you can ask Claude Code to add the configuration for you:
 
-The MCP server should now be available in Cherry Studio.
+```json
+{
+  "projects": {
+    "/path/to/your/project": {
+      "mcpServers": {
+        "workflowy": {
+          "type": "streamable-http",
+          "url": "https://workflowy-mcp.vercel.app/api/mcp",
+          "headers": {
+            "Authorization": "Bearer <your-workflowy-api-key>"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Replace `/path/to/your/project` with your actual project directory (or use `/Users/yourusername` for global access).
+
+The MCP server should now be available in Claude Code.
 
 ## Authentication
 
