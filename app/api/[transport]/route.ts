@@ -5,9 +5,23 @@ const handler = createMcpHandler(
   (server) => {
     server.tool(
       "workflowy_api",
-      "Make requests to the Workflowy API",
+      `Make requests to the Workflowy API. Available endpoints:
+- POST /api/v1/nodes (create node: name, parent_id required in body)
+- POST /api/v1/nodes/:id (update node)
+- GET /api/v1/nodes/:id (get single node)
+- GET /api/v1/nodes?parent_id=X (list children, parent_id can be UUID, "inbox", "home", or "None" for top-level)
+- DELETE /api/v1/nodes/:id (delete node)
+- POST /api/v1/nodes/:id/move (move node: parent_id required in body)
+- POST /api/v1/nodes/:id/complete (mark complete)
+- POST /api/v1/nodes/:id/uncomplete (mark incomplete)
+- GET /api/v1/nodes-export (export all nodes, rate limit: 1/min)
+- GET /api/v1/targets (get targets like inbox, home)`,
       {
-        path: z.string().describe("Workflowy API path starting with /api/..."),
+        path: z
+          .string()
+          .describe(
+            "Workflowy API path starting with /api/v1/... (e.g., /api/v1/nodes?parent_id=None)",
+          ),
         method: z
           .enum(["GET", "POST", "DELETE"])
           .default("GET")
