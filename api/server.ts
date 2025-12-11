@@ -3,34 +3,81 @@ import { z } from "zod";
 
 const handler = createMcpHandler((server) => {
   server.tool(
-    "roll_dice",
-    "Rolls an N-sided die",
-    { sides: z.number().int().min(2) },
-    async ({ sides }) => {
-      const value = 1 + Math.floor(Math.random() * sides);
-      return {
-        content: [{ type: "text", text: `🎲 You rolled a ${value}!` }],
-      };
-    },
-  );
-  server.tool(
-    "get_weather",
-    "Get the current weather at a location",
+    "workflowy_api",
     {
-      latitude: z.number(),
-      longitude: z.number(),
-      city: z.string(),
+      path: z
+        .string()
+        .describe(
+          "Workflowy API path starting with /api/, e.g. /api/v1/targets, /api/v1/nodes, /api/v1/nodes/{id}/move, /api/v1/nodes-export",
+        ),
+      method: z
+        .enum(["GET", "POST", "DELETE"])
+        .default("GET")
+        .describe("HTTP method for the Workflowy API endpoint."),
+      query: z
+        .record(z.any())
+        .optional()
+        .describe("Query params for GET, e.g. { parent_id: 'inbox' }."),
+      body: z
+        .record(z.any())
+        .optional()
+        .describe("JSON body for POST, e.g. node creation or updates."),
     },
-    async ({ latitude, longitude, city }) => {
-      const response = await fetch(
-        `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weathercode,relativehumidity_2m&timezone=auto`,
-      );
-      const weatherData = await response.json();
+    async ({ path, method, query, body }, { env, logger }) => {
+      if (!path.startsWith("/api/")) {
+        throw new Error("path must start with /api/");
+      }
+
+      const apiKey = env.WORKFLOWY_API_KEY;
+      if (!apiKey) {
+        throw new Error("WORKFLOWY_API_KEY is not set in Vercel env variables.");
+      }
+
+      const qs = new URLSearchParams(
+        Object.entries(query || {}).reduce<Record<string, string>>((acc, [k, v]) => {
+          if (v !== undefined && v !== null) acc[k] = String(v);
+          return acc;
+        }, {}),
+      ).toString();
+
+      const url = `https://workflowy.com${path}${qs ? "?" + qs : ""}`;
+
+      logger?.info?.(`[workflowy_api] Request: ${method} ${url}`);
+
+      const res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body:
+          method === "GET" || method === "DELETE"
+            ? undefined
+            : body
+              ? JSON.stringify(body)
+              : undefined,
+      });
+
+      const text = await res.text();
+      let data: unknown;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = { raw: text };
+      }
+
       return {
         content: [
           {
-            type: "text",
-            text: `🌤️ Weather in ${city}: ${weatherData.current.temperature_2m}°C, Humidity: ${weatherData.current.relativehumidity_2m}%`,
+            type: "json",
+            // MCP tools usually return an array of content blocks; here we use one JSON block
+            data: {
+              path,
+              method,
+              http_status: res.status,
+              ok: res.ok,
+              data,
+            },
           },
         ],
       };
