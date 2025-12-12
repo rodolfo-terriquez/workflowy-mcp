@@ -71,21 +71,6 @@ function getApiKey(extra: { authInfo?: AuthInfo }): string {
   return extra.authInfo.token;
 }
 
-// Validate that the provided token is a valid Workflowy API key
-async function validateWorkflowyToken(apiKey: string): Promise<void> {
-  const res = await fetch("https://workflowy.com/api/v1/targets", {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error("Invalid Workflowy API key");
-  }
-}
-
 const handler = createMcpHandler(
   (server) => {
     // ==================== BOOKMARK TOOLS ====================
@@ -102,7 +87,7 @@ const handler = createMcpHandler(
         node_id: z.string().describe("The Workflowy node UUID to bookmark"),
       },
       async ({ name, node_id }: { name: string; node_id: string }, extra) => {
-        await validateWorkflowyToken(getApiKey(extra));
+        getApiKey(extra); // Ensure auth is present
         const sql = await getDb();
         await sql`
           INSERT INTO bookmarks (name, node_id)
@@ -125,7 +110,7 @@ const handler = createMcpHandler(
       "List all saved Workflowy bookmarks. Use this to see what locations have been bookmarked.",
       {},
       async (_args, extra) => {
-        await validateWorkflowyToken(getApiKey(extra));
+        getApiKey(extra); // Ensure auth is present
         const sql = await getDb();
         const result =
           await sql`SELECT name, node_id, created_at FROM bookmarks ORDER BY name`;
@@ -142,7 +127,7 @@ const handler = createMcpHandler(
         name: z.string().describe("The bookmark name to delete"),
       },
       async ({ name }: { name: string }, extra) => {
-        await validateWorkflowyToken(getApiKey(extra));
+        getApiKey(extra); // Ensure auth is present
         const sql = await getDb();
         const result =
           await sql`DELETE FROM bookmarks WHERE name = ${name} RETURNING name`;
@@ -405,10 +390,37 @@ const verifyToken = async (
 ): Promise<AuthInfo | undefined> => {
   if (!bearerToken) return undefined;
 
-  // The bearer token IS the Workflowy API key
-  // We pass it through as the token so tool handlers can access it
+  // Check access secret if configured
+  // Token format: "ACCESS_SECRET:WORKFLOWY_API_KEY" or just "WORKFLOWY_API_KEY" if no secret set
+  const accessSecret = process.env.ACCESS_SECRET;
+  let workflowyApiKey = bearerToken;
+
+  if (accessSecret) {
+    const separator = ":";
+    const separatorIndex = bearerToken.indexOf(separator);
+
+    if (separatorIndex === -1) {
+      // No separator found, reject
+      return undefined;
+    }
+
+    const providedSecret = bearerToken.slice(0, separatorIndex);
+    if (providedSecret !== accessSecret) {
+      // Secret doesn't match, reject
+      return undefined;
+    }
+
+    // Extract the actual Workflowy API key after the secret
+    workflowyApiKey = bearerToken.slice(separatorIndex + 1);
+
+    if (!workflowyApiKey) {
+      // No API key after secret, reject
+      return undefined;
+    }
+  }
+
   return {
-    token: bearerToken,
+    token: workflowyApiKey,
     scopes: ["workflowy"],
     clientId: "workflowy-user",
   };

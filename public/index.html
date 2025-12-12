@@ -90,21 +90,54 @@
         </p>
 
         <div class="card">
-            <h2>How to Connect</h2>
+            <h2>Step 1: Set Up Access Secret (Vercel)</h2>
             <p>
-                This is an MCP (Model Context Protocol) server. To use it,
-                configure your MCP client with:
+                To secure your MCP server, you must set an access secret in your
+                Vercel project settings:
             </p>
-            <p><strong>URL:</strong> <code>/api/mcp</code></p>
             <p>
-                <strong>Header:</strong>
-                <code>Authorization: Bearer YOUR_WORKFLOWY_API_KEY</code>
+                1. Go to your Vercel project &rarr; Settings &rarr; Environment
+                Variables
             </p>
+            <p>
+                2. Add a new variable named <code>ACCESS_SECRET</code> with a
+                strong random value
+            </p>
+            <p>
+                3. Generate a secure secret using:
+                <code>openssl rand -hex 32</code>
+            </p>
+            <p>4. Redeploy your project for changes to take effect</p>
+        </div>
+
+        <div class="card">
+            <h2>Step 2: Get Your Workflowy API Key</h2>
             <p>
                 Get your API key from
                 <a href="https://beta.workflowy.com/api-reference/"
                     >beta.workflowy.com/api-reference</a
                 >
+            </p>
+        </div>
+
+        <div class="card">
+            <h2>Step 3: Configure Your MCP Client</h2>
+            <p>
+                This is an MCP (Model Context Protocol) server. Configure your
+                MCP client with:
+            </p>
+            <p><strong>URL:</strong> <code>/api/mcp</code></p>
+            <p>
+                <strong>Header:</strong>
+                <code
+                    >Authorization: Bearer
+                    YOUR_ACCESS_SECRET:YOUR_WORKFLOWY_API_KEY</code
+                >
+            </p>
+            <p>
+                The bearer token format is
+                <code>ACCESS_SECRET:WORKFLOWY_API_KEY</code> (separated by a
+                colon).
             </p>
         </div>
 
@@ -120,7 +153,7 @@
           "type": "streamable-http",
           "url": "https://workflowy-mcp.vercel.app/api/mcp",
           "headers": {
-            "Authorization": "Bearer YOUR_WORKFLOWY_API_KEY"
+            "Authorization": "Bearer YOUR_ACCESS_SECRET:YOUR_WORKFLOWY_API_KEY"
           }
         }
       }
@@ -128,6 +161,11 @@
   }
 }</pre
             >
+            <p>
+                Replace <code>YOUR_ACCESS_SECRET</code> with the secret you set
+                in Vercel, and <code>YOUR_WORKFLOWY_API_KEY</code> with your
+                Workflowy API key.
+            </p>
         </div>
 
         <p class="github">
