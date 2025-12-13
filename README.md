@@ -8,7 +8,7 @@ An MCP (Model Context Protocol) server that connects AI assistants to your Workf
 
 1. Fork or clone this repository
 2. Import the project in Vercel
-3. Add environment variables in your Vercel project settings:
+3. Add environment variables in your Vercel project settings (ACCESS_SECRET is required; requests are rejected when it's not set):
    - `DATABASE_URL` - Your Neon database connection string
    - `ACCESS_SECRET` - A strong random secret to secure your server. Generate one with: `openssl rand -hex 32`
    
