@@ -390,33 +390,34 @@ const verifyToken = async (
 ): Promise<AuthInfo | undefined> => {
   if (!bearerToken) return undefined;
 
-  // Check access secret if configured
-  // Token format: "ACCESS_SECRET:WORKFLOWY_API_KEY" or just "WORKFLOWY_API_KEY" if no secret set
+  // Token format: "ACCESS_SECRET:WORKFLOWY_API_KEY"
   const accessSecret = process.env.ACCESS_SECRET;
-  let workflowyApiKey = bearerToken;
+  if (!accessSecret) {
+    // Without an access secret, all users would share the same database and unauthenticated callers could
+    // access bookmarks. Treat a missing secret as a misconfiguration and reject the request outright.
+    return undefined;
+  }
 
-  if (accessSecret) {
-    const separator = ":";
-    const separatorIndex = bearerToken.indexOf(separator);
+  const separator = ":";
+  const separatorIndex = bearerToken.indexOf(separator);
 
-    if (separatorIndex === -1) {
-      // No separator found, reject
-      return undefined;
-    }
+  if (separatorIndex <= 0) {
+    // No secret provided or colon at first position (empty secret), reject
+    return undefined;
+  }
 
-    const providedSecret = bearerToken.slice(0, separatorIndex);
-    if (providedSecret !== accessSecret) {
-      // Secret doesn't match, reject
-      return undefined;
-    }
+  const providedSecret = bearerToken.slice(0, separatorIndex);
+  if (providedSecret !== accessSecret) {
+    // Secret doesn't match, reject
+    return undefined;
+  }
 
-    // Extract the actual Workflowy API key after the secret
-    workflowyApiKey = bearerToken.slice(separatorIndex + 1);
+  // Extract the actual Workflowy API key after the secret
+  const workflowyApiKey = bearerToken.slice(separatorIndex + 1);
 
-    if (!workflowyApiKey) {
-      // No API key after secret, reject
-      return undefined;
-    }
+  if (!workflowyApiKey) {
+    // No API key after secret, reject
+    return undefined;
   }
 
   return {
