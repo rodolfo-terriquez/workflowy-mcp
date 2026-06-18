@@ -709,6 +709,45 @@ function validateOperations(operations: LlmDocOperation[]): string | null {
   return null;
 }
 
+function isConcreteNodeId(value: string): boolean {
+  return /^[0-9a-f]{12}$/i.test(value) || /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(value);
+}
+
+function concreteRootFromReadResult(value: unknown): string | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  for (const [key, childValue] of Object.entries(value)) {
+    if (!NODE_META_KEYS.has(key) && typeof childValue === "string") {
+      return key;
+    }
+  }
+
+  return null;
+}
+
+async function resolveEditableRoot(apiKey: string, root: string): Promise<string> {
+  const normalizedRoot = normalizeNodeId(root);
+  if (isConcreteNodeId(normalizedRoot)) {
+    return normalizedRoot;
+  }
+
+  const result = await workflowyJsonRequest(
+    apiKey,
+    `${LLM_DOC_API_BASE}/api/llm/doc/read/${encodeURIComponent(
+      normalizedRoot,
+    )}/?depth=10`,
+    { method: "GET" },
+  );
+
+  if (!result.ok) {
+    throw new Error(`Workflowy root read failed with HTTP ${result.status}`);
+  }
+
+  return concreteRootFromReadResult(result.data) ?? normalizedRoot;
+}
+
 async function llmDocEdit(
   apiKey: string,
   root: string,
@@ -720,7 +759,7 @@ async function llmDocEdit(
   }
 
   const body = {
-    root: normalizeNodeId(root),
+    root: await resolveEditableRoot(apiKey, root),
     operations,
   };
 
