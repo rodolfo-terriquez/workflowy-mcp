@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "crypto";
 import { NextRequest, NextResponse } from "next/server";
+import packageJson from "../../../package.json";
 
 export const ADMIN_COOKIE_NAME = "workflowy_mcp_admin";
 
@@ -13,6 +14,7 @@ interface SessionPayload {
 export interface AdminStatus {
   authenticated: boolean;
   admin_configured: boolean;
+  version: string;
   endpoint: string;
   mcp_access_secret_configured: boolean;
   workflowy_api_key_configured: boolean;
@@ -124,6 +126,7 @@ export function buildAdminStatus(request: NextRequest, authenticated: boolean): 
   return {
     authenticated,
     admin_configured: Boolean(getAdminSecret()),
+    version: packageJson.version,
     endpoint: `${origin}/api/mcp`,
     mcp_access_secret_configured: Boolean(getMcpAccessSecret()),
     workflowy_api_key_configured: Boolean(getWorkflowyApiKey()),

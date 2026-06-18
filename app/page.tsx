@@ -35,6 +35,7 @@ interface CacheStatus {
 interface AdminStatus {
   authenticated: boolean;
   admin_configured: boolean;
+  version: string;
   endpoint: string;
   mcp_access_secret_configured: boolean;
   workflowy_api_key_configured: boolean;
@@ -859,18 +860,10 @@ export default function Home() {
 
             <div className={styles.dashboardInfoGrid}>
               <div className={styles.dashboardInfoItem}>
-                <span className={styles.dashboardInfoLabel}>Endpoint</span>
-                <span className={styles.dashboardInfoValue}>
-                  {endpoint ? "Configured" : "Missing"}
-                </span>
+                <span className={styles.dashboardInfoLabel}>Version</span>
+                <span className={styles.dashboardInfoValue}>v{adminStatus?.version ?? "0.1.0"}</span>
               </div>
               <div className={styles.dashboardInfoItem}>
-                <span className={styles.dashboardInfoLabel}>Workflowy Key</span>
-                <span className={styles.dashboardInfoValue}>
-                  {adminStatus?.workflowy_api_key_configured ? "Server-side" : "Missing"}
-                </span>
-              </div>
-              <div className={`${styles.dashboardInfoItem} ${styles.dashboardInfoFull}`}>
                 <span className={styles.dashboardInfoLabel}>Cache</span>
                 <span className={styles.dashboardInfoValue}>
                   {cacheStatus

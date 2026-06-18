@@ -31,6 +31,14 @@
 }
 
 .dashboardWrapper {
+  --text: #e0e0e0;
+  --muted: #8c8ca3;
+  --accent: #a5a8fc;
+  --primary: #6366f1;
+  --danger: #f87171;
+  --success: #86efac;
+  --warning: #facc15;
+
   position: relative;
   z-index: 1;
   min-height: 100vh;
@@ -89,11 +97,13 @@
 .dashboardStatusDot {
   width: 8px;
   height: 8px;
+  background: var(--muted);
   border-radius: 999px;
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.08);
 }
 
 .dashboardStatusText {
-  color: var(--success);
+  color: var(--text);
   font-size: 13px;
   font-weight: 550;
 }
