@@ -17,13 +17,14 @@ Current remote tools:
 | `delete_bookmark` | Delete a saved bookmark by name |
 | `read_doc` | Read a node and its children through Workflowy's LLM Doc API |
 | `edit_doc` | Batch insert, update, delete, or move nodes through Workflowy's LLM Doc API |
+| `search_nodes` | Search the Neon-backed Workflowy cache |
+| `sync_nodes` | Refresh the Neon-backed cache from Workflowy's full export |
 | `get_targets` | Fetch special Workflowy targets such as inbox and home |
 
 Planned next:
 
-- Neon-backed cache and full-text `search_nodes`
-- `sync_nodes` through the `nodes-export` endpoint
 - Backup tools backed by object storage
+- Incremental cache refresh after `edit_doc`
 - More formal OAuth-style auth for shared/multi-user deployments
 - Cloudflare deployment option
 
@@ -155,4 +156,5 @@ http://localhost:3000/api/mcp
 
 - Vercel Fluid compute is recommended for long-lived MCP requests.
 - The Workflowy `nodes-export` endpoint is rate limited to 1 request per minute. Cache/search work should respect that limit.
+- `sync_nodes` replaces the remote cache for the current Workflowy API key. Search results include cache freshness metadata.
 - This first remote version intentionally does not store your Workflowy API key. Future hosted/multi-user versions should use a more complete authorization flow.
