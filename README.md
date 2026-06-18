@@ -181,6 +181,62 @@ Claude-style configuration:
 
 The web console's Setup page can copy these templates for you. Replace the placeholder `MCP_ACCESS_SECRET` with the actual secret you saved in Vercel.
 
+## Run With Docker
+
+Vercel is the easiest hosted path, but the app can also run in a Docker container. You still need a reachable Postgres database, such as Neon, and the same environment variables.
+
+Create a `Dockerfile`:
+
+```dockerfile
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+ENV NODE_ENV=production
+ENV PORT=3000
+
+EXPOSE 3000
+
+CMD ["npm", "run", "start"]
+```
+
+Build the image:
+
+```sh
+docker build -t workflowy-mcp .
+```
+
+Run it locally:
+
+```sh
+docker run --rm -p 3000:3000 \
+  -e DATABASE_URL="postgres://..." \
+  -e ADMIN_SECRET="your-admin-secret" \
+  -e MCP_ACCESS_SECRET="your-mcp-access-secret" \
+  -e WORKFLOWY_API_KEY="your-workflowy-api-key" \
+  workflowy-mcp
+```
+
+Open the web console:
+
+```text
+http://localhost:3000/
+```
+
+Local Docker MCP endpoint:
+
+```text
+http://localhost:3000/api/mcp
+```
+
+For a remote Docker deployment, put the container behind HTTPS with a reverse proxy or hosting platform such as Caddy, nginx, Fly.io, Render, Railway, a VPS, or a cloud load balancer. MCP clients connecting over the internet should use an `https://` endpoint.
+
 ## First Setup In The Web Console
 
 Recommended order:
