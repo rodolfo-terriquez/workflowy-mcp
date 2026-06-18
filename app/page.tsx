@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import styles from "./page.module.css";
 
 type Section = "connection" | "setup" | "tools" | "bookmarks" | "cache" | "diagnostics";
@@ -25,6 +25,15 @@ interface CacheStatus {
   last_synced_at: string;
   is_stale: boolean;
   sync_in_progress: boolean;
+}
+
+interface AdminStatus {
+  authenticated: boolean;
+  admin_configured: boolean;
+  endpoint: string;
+  mcp_access_secret_configured: boolean;
+  workflowy_api_key_configured: boolean;
+  database_configured: boolean;
 }
 
 interface ActivityLog {
@@ -62,7 +71,6 @@ interface SearchPayload {
   error?: string;
 }
 
-const STORAGE_KEY = "workflowy-mcp-console";
 const navItems: Array<{ id: Section; label: string }> = [
   { id: "connection", label: "Connection" },
   { id: "setup", label: "Setup" },
@@ -94,16 +102,6 @@ function formatTime(value: string): string {
     minute: "2-digit",
     second: "2-digit",
   });
-}
-
-function maskSecret(value: string): string {
-  if (!value) {
-    return "not set";
-  }
-  if (value.length <= 10) {
-    return "configured";
-  }
-  return `${value.slice(0, 4)}...${value.slice(-4)}`;
 }
 
 function initParticleBackground(canvas: HTMLCanvasElement): () => void {
@@ -148,13 +146,13 @@ function initParticleBackground(canvas: HTMLCanvasElement): () => void {
   }
 
   function draw(time: number) {
-    context.fillStyle = "#1a1a2e";
+    context.fillStyle = "#171728";
     context.fillRect(0, 0, width, height);
 
     for (const dot of dots) {
       const edgeFade = Math.min(dot.y, height - dot.y, 300) / 300;
       const pulse = (Math.sin(time * dot.speed + dot.phase) + 1) / 2;
-      const alpha = 0.12 + pulse * 0.26 * edgeFade;
+      const alpha = 0.05 + pulse * 0.13 * edgeFade;
       context.fillStyle = `rgba(165, 168, 252, ${alpha})`;
       context.beginPath();
       context.arc(dot.x, dot.y, radius, 0, Math.PI * 2);
@@ -177,11 +175,13 @@ function initParticleBackground(canvas: HTMLCanvasElement): () => void {
 export default function Home() {
   const particleCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [appMode, setAppMode] = useState<"dashboard" | "settings">("dashboard");
+  const [adminStatus, setAdminStatus] = useState<AdminStatus | null>(null);
+  const [adminSecret, setAdminSecret] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+  const [isAuthBusy, setIsAuthBusy] = useState(false);
   const [activeSection, setActiveSection] = useState<Section>("connection");
   const [setupTab, setSetupTab] = useState<SetupTab>("claude");
   const [endpoint, setEndpoint] = useState("");
-  const [accessSecret, setAccessSecret] = useState("");
-  const [workflowyApiKey, setWorkflowyApiKey] = useState("");
   const [connectionStatus, setConnectionStatus] = useState<"idle" | "checking" | "connected" | "failed">("idle");
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
@@ -195,23 +195,8 @@ export default function Home() {
   const [isBusy, setIsBusy] = useState(false);
 
   useEffect(() => {
-    const origin = window.location.origin;
-    setEndpoint(`${origin}/api/mcp`);
-    const saved = window.localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved) as {
-          endpoint?: string;
-          accessSecret?: string;
-          workflowyApiKey?: string;
-        };
-        setEndpoint(parsed.endpoint || `${origin}/api/mcp`);
-        setAccessSecret(parsed.accessSecret || "");
-        setWorkflowyApiKey(parsed.workflowyApiKey || "");
-      } catch {
-        window.localStorage.removeItem(STORAGE_KEY);
-      }
-    }
+    setEndpoint(`${window.location.origin}/api/mcp`);
+    void refreshAdminSession(false);
   }, []);
 
   useEffect(() => {
@@ -221,17 +206,19 @@ export default function Home() {
     return initParticleBackground(particleCanvasRef.current);
   }, []);
 
-  const authToken = useMemo(
-    () => `${accessSecret.trim()}:${workflowyApiKey.trim()}`,
-    [accessSecret, workflowyApiKey],
+  const isAuthenticated = Boolean(adminStatus?.authenticated);
+  const serverReady = Boolean(
+    adminStatus?.mcp_access_secret_configured &&
+      adminStatus.workflowy_api_key_configured &&
+      adminStatus.database_configured,
   );
-
-  const authHeader = useMemo(
-    () => `Bearer ${authToken}`,
-    [authToken],
-  );
-
-  const canCallMcp = Boolean(endpoint && accessSecret.trim() && workflowyApiKey.trim());
+  const canCallMcp = Boolean(endpoint && isAuthenticated && serverReady);
+  const statusTone =
+    !adminStatus || isAuthBusy
+      ? "checking"
+      : !adminStatus.admin_configured || (isAuthenticated && !serverReady)
+        ? "failed"
+        : connectionStatus;
 
   function addLog(type: LogType, message: string): void {
     setActivity((current) => [
@@ -245,36 +232,93 @@ export default function Home() {
     ]);
   }
 
-  function saveLocalSettings(): void {
-    window.localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({ endpoint, accessSecret, workflowyApiKey }),
-    );
-    addLog("success", "Connection settings saved in this browser.");
+  async function refreshAdminSession(showLog = true): Promise<void> {
+    try {
+      const response = await fetch("/api/admin/session", {
+        credentials: "same-origin",
+      });
+      const status = (await response.json()) as AdminStatus;
+      setAdminStatus(status);
+      setEndpoint(status.endpoint || `${window.location.origin}/api/mcp`);
+      if (!status.authenticated) {
+        setConnectionStatus("idle");
+        setTools([]);
+        setBookmarks([]);
+        setCacheStatus(null);
+        setSearchResults([]);
+        setAppMode("dashboard");
+      }
+      if (showLog) {
+        addLog("info", "Admin session status refreshed.");
+      }
+    } catch (error) {
+      setAuthMessage(error instanceof Error ? error.message : String(error));
+    }
   }
 
-  function clearLocalSettings(): void {
-    window.localStorage.removeItem(STORAGE_KEY);
-    setAccessSecret("");
-    setWorkflowyApiKey("");
-    setTools([]);
-    setBookmarks([]);
-    setCacheStatus(null);
-    setSearchResults([]);
-    setConnectionStatus("idle");
-    addLog("info", "Local connection settings cleared.");
+  async function loginAdmin(event?: FormEvent<HTMLFormElement>): Promise<void> {
+    event?.preventDefault();
+    setIsAuthBusy(true);
+    setAuthMessage("");
+    try {
+      const response = await fetch("/api/admin/login", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ secret: adminSecret }),
+      });
+      const data = (await response.json()) as AdminStatus & { error?: string };
+      if (!response.ok) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
+      setAdminStatus(data);
+      setEndpoint(data.endpoint || `${window.location.origin}/api/mcp`);
+      setAdminSecret("");
+      setAuthMessage("");
+      addLog("success", "Admin console unlocked.");
+    } catch (error) {
+      setAuthMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsAuthBusy(false);
+    }
+  }
+
+  async function logoutAdmin(): Promise<void> {
+    setIsAuthBusy(true);
+    try {
+      await fetch("/api/admin/logout", {
+        method: "POST",
+        credentials: "same-origin",
+      });
+      setAdminStatus((current) =>
+        current
+          ? { ...current, authenticated: false }
+          : null,
+      );
+      setConnectionStatus("idle");
+      setTools([]);
+      setBookmarks([]);
+      setCacheStatus(null);
+      setSearchResults([]);
+      setAppMode("dashboard");
+      addLog("info", "Admin console locked.");
+    } catch (error) {
+      setAuthMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsAuthBusy(false);
+    }
   }
 
   async function mcpRequest<T = unknown>(method: string, params: unknown): Promise<T> {
     if (!canCallMcp) {
-      throw new Error("Connection fields are incomplete.");
+      throw new Error("Admin session or server configuration is incomplete.");
     }
 
-    const response = await fetch(endpoint, {
+    const response = await fetch("/api/admin/mcp", {
       method: "POST",
+      credentials: "same-origin",
       headers: {
         Accept: "application/json, text/event-stream",
-        Authorization: authHeader,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -449,7 +493,7 @@ export default function Home() {
       "type": "streamable-http",
       "url": "${endpoint || "https://YOUR-APP.vercel.app/api/mcp"}",
       "headers": {
-        "Authorization": "Bearer ${canCallMcp ? authToken : "ACCESS_SECRET:WORKFLOWY_API_KEY"}"
+        "Authorization": "Bearer MCP_ACCESS_SECRET"
       }
     }
   }
@@ -459,29 +503,40 @@ export default function Home() {
     setupTab === "claude"
       ? claudeConfig
       : setupTab === "generic"
-        ? `Endpoint: ${endpoint}\nAuthorization: Bearer ${authToken}`
+        ? `Endpoint: ${endpoint}\nAuthorization: Bearer MCP_ACCESS_SECRET`
         : JSON.stringify(
             {
               type: "streamable-http",
               url: endpoint,
-              headers: { Authorization: "Bearer ACCESS_SECRET:WORKFLOWY_API_KEY" },
+              headers: { Authorization: "Bearer MCP_ACCESS_SECRET" },
             },
             null,
             2,
           );
 
-  const connectionText =
-    connectionStatus === "connected"
+  const connectionText = (() => {
+    if (!adminStatus) {
+      return "Checking admin session";
+    }
+    if (!adminStatus.admin_configured) {
+      return "ADMIN_SECRET missing";
+    }
+    if (!isAuthenticated) {
+      return "Admin console locked";
+    }
+    if (!serverReady) {
+      return "Server configuration incomplete";
+    }
+    return connectionStatus === "connected"
       ? "Remote MCP connected"
-      : canCallMcp
-        ? "Ready to test connection"
-        : "Connection not configured";
+      : "Ready to test connection";
+  })();
 
   return (
     <>
       <canvas ref={particleCanvasRef} className={styles.particleCanvas} />
 
-      {appMode === "dashboard" && (
+      {!isAuthenticated && (
         <main className={styles.dashboardWrapper}>
           <section className={styles.dashboardCard}>
             <div className={styles.dashboardHeader}>
@@ -490,7 +545,48 @@ export default function Home() {
             </div>
 
             <div className={styles.dashboardStatus}>
-              <span className={`${styles.dashboardStatusDot} ${styles[connectionStatus]}`} />
+              <span className={`${styles.dashboardStatusDot} ${styles[statusTone]}`} />
+              <span className={styles.dashboardStatusText}>{connectionText}</span>
+            </div>
+
+            <form className={styles.loginForm} onSubmit={loginAdmin}>
+              <label className={styles.inputGroup}>
+                <span>Admin Secret</span>
+                <input
+                  type="password"
+                  value={adminSecret}
+                  onChange={(event) => setAdminSecret(event.target.value)}
+                  placeholder="ADMIN_SECRET"
+                  disabled={!adminStatus?.admin_configured || isAuthBusy}
+                />
+              </label>
+              <button
+                className={styles.dashboardSettingsButton}
+                disabled={!adminStatus?.admin_configured || !adminSecret || isAuthBusy}
+                type="submit"
+              >
+                Unlock Console
+              </button>
+            </form>
+
+            {authMessage && <p className={styles.loginMessage}>{authMessage}</p>}
+            {adminStatus && !adminStatus.admin_configured && (
+              <p className={styles.loginMessage}>Set ADMIN_SECRET in Vercel to enable the web console.</p>
+            )}
+          </section>
+        </main>
+      )}
+
+      {isAuthenticated && appMode === "dashboard" && (
+        <main className={styles.dashboardWrapper}>
+          <section className={styles.dashboardCard}>
+            <div className={styles.dashboardHeader}>
+              <img src="/wf-mcp.png" alt="" className={styles.dashboardLogo} />
+              <h1>Workflowy MCP</h1>
+            </div>
+
+            <div className={styles.dashboardStatus}>
+              <span className={`${styles.dashboardStatusDot} ${styles[statusTone]}`} />
               <span className={styles.dashboardStatusText}>{connectionText}</span>
             </div>
 
@@ -502,28 +598,39 @@ export default function Home() {
                 </span>
               </div>
               <div className={styles.dashboardInfoItem}>
+                <span className={styles.dashboardInfoLabel}>Workflowy Key</span>
+                <span className={styles.dashboardInfoValue}>
+                  {adminStatus?.workflowy_api_key_configured ? "Server-side" : "Missing"}
+                </span>
+              </div>
+              <div className={`${styles.dashboardInfoItem} ${styles.dashboardInfoFull}`}>
                 <span className={styles.dashboardInfoLabel}>Cache</span>
                 <span className={styles.dashboardInfoValue}>
                   {cacheStatus
                     ? `${cacheStatus.node_count.toLocaleString()} nodes`
-                    : "Not checked"}
-                </span>
-              </div>
-              <div className={`${styles.dashboardInfoItem} ${styles.dashboardInfoFull}`}>
-                <span className={styles.dashboardInfoLabel}>Credentials</span>
-                <span className={styles.dashboardInfoValue}>
-                  {canCallMcp ? "Stored in this browser session" : "Add in settings"}
+                    : adminStatus?.database_configured
+                      ? "Ready"
+                      : "Database missing"}
                 </span>
               </div>
             </div>
 
-            <button
-              className={styles.dashboardSettingsButton}
-              onClick={() => setAppMode("settings")}
-              type="button"
-            >
-              Edit Settings
-            </button>
+            <div className={styles.dashboardActionRow}>
+              <button
+                className={styles.dashboardSettingsButton}
+                onClick={() => setAppMode("settings")}
+                type="button"
+              >
+                Edit Settings
+              </button>
+              <button
+                className={styles.dashboardSecondaryButton}
+                onClick={logoutAdmin}
+                type="button"
+              >
+                Lock
+              </button>
+            </div>
           </section>
 
           <a
@@ -537,7 +644,7 @@ export default function Home() {
         </main>
       )}
 
-      {appMode === "settings" && (
+      {isAuthenticated && appMode === "settings" && (
     <main className={styles.appLayout}>
       <aside className={styles.sidebar}>
         <div className={styles.sidebarHeader}>
@@ -569,8 +676,8 @@ export default function Home() {
         </nav>
 
         <div className={styles.sidebarFooter}>
-          <span className={`${styles.statusDot} ${styles[connectionStatus]}`} />
-          <span>{connectionStatus === "connected" ? "Connected" : "Not connected"}</span>
+          <span className={`${styles.statusDot} ${styles[statusTone]}`} />
+          <span>{connectionStatus === "connected" ? "Connected" : "Admin unlocked"}</span>
         </div>
       </aside>
 
@@ -578,54 +685,36 @@ export default function Home() {
         <div className={styles.container}>
           {activeSection === "connection" && (
             <>
-              <Header title="Connection" subtitle="Configure browser-local credentials and verify the deployed MCP endpoint." />
+              <Header title="Connection" subtitle="Verify the server-side credentials and deployed MCP endpoint." />
               <div className={styles.panel}>
                 <div className={styles.gridTwo}>
                   <label className={styles.inputGroup}>
                     <span>Endpoint</span>
-                    <input value={endpoint} onChange={(event) => setEndpoint(event.target.value)} />
+                    <input value={endpoint} readOnly />
                   </label>
                   <label className={styles.inputGroup}>
                     <span>Status</span>
                     <input value={connectionStatus} readOnly />
                   </label>
                 </div>
-                <label className={styles.inputGroup}>
-                  <span>Access Secret</span>
-                  <input
-                    type="password"
-                    value={accessSecret}
-                    onChange={(event) => setAccessSecret(event.target.value)}
-                    placeholder="Vercel ACCESS_SECRET"
-                  />
-                </label>
-                <label className={styles.inputGroup}>
-                  <span>Workflowy API Key</span>
-                  <input
-                    type="password"
-                    value={workflowyApiKey}
-                    onChange={(event) => setWorkflowyApiKey(event.target.value)}
-                    placeholder="Workflowy API key"
-                  />
-                </label>
                 <div className={styles.buttonRow}>
                   <button className={styles.primaryButton} onClick={testConnection} disabled={isBusy || !canCallMcp} type="button">
                     Test Connection
                   </button>
-                  <button className={styles.secondaryButton} onClick={saveLocalSettings} disabled={!canCallMcp} type="button">
-                    Save Locally
+                  <button className={styles.secondaryButton} onClick={() => refreshAdminSession()} disabled={isBusy} type="button">
+                    Refresh Status
                   </button>
-                  <button className={styles.dangerButton} onClick={clearLocalSettings} type="button">
-                    Clear
+                  <button className={styles.dangerButton} onClick={logoutAdmin} type="button">
+                    Lock Console
                   </button>
                 </div>
               </div>
 
               <div className={styles.summaryGrid}>
                 <Metric label="Endpoint" value={endpoint ? "configured" : "missing"} />
-                <Metric label="Access Secret" value={maskSecret(accessSecret)} />
-                <Metric label="Workflowy Key" value={maskSecret(workflowyApiKey)} />
-                <Metric label="Tools" value={tools.length ? String(tools.length) : "not loaded"} />
+                <Metric label="MCP Secret" value={adminStatus?.mcp_access_secret_configured ? "configured" : "missing"} />
+                <Metric label="Workflowy Key" value={adminStatus?.workflowy_api_key_configured ? "server-side" : "missing"} />
+                <Metric label="Database" value={adminStatus?.database_configured ? "configured" : "missing"} />
               </div>
             </>
           )}

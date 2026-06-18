@@ -8,7 +8,7 @@ This is the cloud sibling of [workflowy-local-mcp](https://github.com/rodolfo-te
 
 This repo is being rebuilt around the newer Workflowy LLM Doc API used by `workflowy-local-mcp`.
 
-The root web page is a setup console for configuring credentials locally in the browser, testing the MCP connection, managing bookmarks, syncing/searching the cache, and copying client configuration.
+The root web page is an owner-only setup console for testing the MCP connection, managing bookmarks, syncing/searching the cache, and copying client configuration.
 
 Current remote tools:
 
@@ -36,18 +36,20 @@ This project is designed for personal self-hosting.
 
 Requests must include both:
 
-1. `ACCESS_SECRET` - a strong secret stored in your deployment environment
-2. `WORKFLOWY_API_KEY` - your Workflowy API key, sent by your MCP client on each request
+1. `MCP_ACCESS_SECRET` - a strong secret stored in your deployment environment and sent by your MCP client
+2. `WORKFLOWY_API_KEY` - your Workflowy API key, stored only in the deployment environment
 
 The server expects this header:
 
 ```text
-Authorization: Bearer ACCESS_SECRET:WORKFLOWY_API_KEY
+Authorization: Bearer MCP_ACCESS_SECRET
 ```
 
-The Workflowy API key is not stored in Neon. Bookmarks are stored in Neon under a SHA-256 hash of the API key so multiple keys can share one deployment without sharing bookmark data.
+The root web console is protected separately with `ADMIN_SECRET`. Entering the admin secret sets a short-lived, signed, HTTP-only cookie so only the deployment owner can access the interface.
 
-Remote mode changes the trust model. Your Workflowy API key is sent to your deployed server on each MCP request. If you want the key to never leave your machine, use `workflowy-local-mcp` instead.
+The Workflowy API key is not stored in Neon or browser local storage. Bookmarks are stored in Neon under a SHA-256 hash of the API key.
+
+Remote mode changes the trust model. Your Workflowy API key is stored in your deployed server environment. If you want the key to never leave your machine, use `workflowy-local-mcp` instead.
 
 ## Deploy To Vercel
 
@@ -58,10 +60,12 @@ Remote mode changes the trust model. Your Workflowy API key is sent to your depl
 
 ```text
 DATABASE_URL=postgres://...
-ACCESS_SECRET=replace-with-openssl-rand-hex-32
+ADMIN_SECRET=replace-with-openssl-rand-hex-32
+MCP_ACCESS_SECRET=replace-with-another-openssl-rand-hex-32
+WORKFLOWY_API_KEY=your-workflowy-api-key
 ```
 
-Generate a strong access secret:
+Generate strong secrets:
 
 ```sh
 openssl rand -hex 32
@@ -110,7 +114,7 @@ Add a Streamable HTTP MCP server configuration. Replace all placeholders:
           "type": "streamable-http",
           "url": "https://YOUR-VERCEL-APP.vercel.app/api/mcp",
           "headers": {
-            "Authorization": "Bearer ACCESS_SECRET:WORKFLOWY_API_KEY"
+            "Authorization": "Bearer MCP_ACCESS_SECRET"
           }
         }
       }
@@ -145,7 +149,9 @@ Create `.env.local`:
 
 ```text
 DATABASE_URL=postgres://...
-ACCESS_SECRET=dev-secret
+ADMIN_SECRET=dev-admin-secret
+MCP_ACCESS_SECRET=dev-mcp-secret
+WORKFLOWY_API_KEY=wf_...
 ```
 
 Run Next.js:
@@ -164,6 +170,6 @@ http://localhost:3000/api/mcp
 
 - Vercel Fluid compute is recommended for long-lived MCP requests.
 - The Workflowy `nodes-export` endpoint is rate limited to 1 request per minute. Cache/search work should respect that limit.
-- `sync_nodes` replaces the remote cache for the current Workflowy API key. Search results include cache freshness metadata.
+- `sync_nodes` replaces the remote cache for the configured Workflowy API key. Search results include cache freshness metadata.
 - Backup tools are intentionally not included in the remote server yet. This project is focused on remote read/write/search and first-run setup.
-- This first remote version intentionally does not store your Workflowy API key. Future hosted/multi-user versions should use a more complete authorization flow.
+- The legacy `Authorization: Bearer ACCESS_SECRET:WORKFLOWY_API_KEY` format still works for older clients when `ACCESS_SECRET` is configured, but new deployments should use `MCP_ACCESS_SECRET` and server-side `WORKFLOWY_API_KEY`.

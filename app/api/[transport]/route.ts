@@ -1,8 +1,13 @@
-import { createHash, timingSafeEqual } from "crypto";
+import { createHash } from "crypto";
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import { z } from "zod";
+import {
+  getMcpAccessSecret,
+  getWorkflowyApiKey,
+  timingSafeStringEqual,
+} from "../admin/_auth";
 
 export const runtime = "nodejs";
 
@@ -1083,15 +1088,6 @@ const handler = createMcpHandler(
   { basePath: "/api" },
 );
 
-function timingSafeStringEqual(a: string, b: string): boolean {
-  const aBuffer = Buffer.from(a);
-  const bBuffer = Buffer.from(b);
-  if (aBuffer.length !== bBuffer.length) {
-    return false;
-  }
-  return timingSafeEqual(aBuffer, bBuffer);
-}
-
 const verifyToken = async (
   _req: Request,
   bearerToken?: string,
@@ -1100,9 +1096,22 @@ const verifyToken = async (
     return undefined;
   }
 
-  const accessSecret = process.env.ACCESS_SECRET;
+  const accessSecret = getMcpAccessSecret();
   if (!accessSecret) {
     return undefined;
+  }
+
+  const workflowyApiKeyFromEnv = getWorkflowyApiKey();
+  if (timingSafeStringEqual(bearerToken, accessSecret)) {
+    if (!workflowyApiKeyFromEnv) {
+      return undefined;
+    }
+
+    return {
+      token: workflowyApiKeyFromEnv,
+      scopes: ["workflowy"],
+      clientId: accountKeyFromApiKey(workflowyApiKeyFromEnv).slice(0, 12),
+    };
   }
 
   const separatorIndex = bearerToken.indexOf(":");
