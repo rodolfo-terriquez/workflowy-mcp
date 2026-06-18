@@ -8,6 +8,8 @@ This is the cloud sibling of [workflowy-local-mcp](https://github.com/rodolfo-te
 
 This repo is being rebuilt around the newer Workflowy LLM Doc API used by `workflowy-local-mcp`.
 
+The root web page is a setup console for configuring credentials locally in the browser, testing the MCP connection, managing bookmarks, syncing/searching the cache, and copying client configuration.
+
 Current remote tools:
 
 | Tool | Description |
@@ -19,11 +21,11 @@ Current remote tools:
 | `edit_doc` | Batch insert, update, delete, or move nodes through Workflowy's LLM Doc API |
 | `search_nodes` | Search the Neon-backed Workflowy cache |
 | `sync_nodes` | Refresh the Neon-backed cache from Workflowy's full export |
+| `cache_status` | Show cache freshness and node count without running a search |
 | `get_targets` | Fetch special Workflowy targets such as inbox and home |
 
 Planned next:
 
-- Backup tools backed by object storage
 - Incremental cache refresh after `edit_doc`
 - More formal OAuth-style auth for shared/multi-user deployments
 - Cloudflare deployment option
@@ -74,6 +76,12 @@ ALLOWED_ORIGINS=https://claude.ai
 If `ALLOWED_ORIGINS` is unset, requests without an `Origin` header are allowed. If it is set, browser-originated requests must match one of the comma-separated origins.
 
 5. Deploy.
+
+Open the deployed URL to use the setup console:
+
+```text
+https://YOUR-VERCEL-APP.vercel.app/
+```
 
 Your MCP endpoint will be:
 
@@ -157,4 +165,5 @@ http://localhost:3000/api/mcp
 - Vercel Fluid compute is recommended for long-lived MCP requests.
 - The Workflowy `nodes-export` endpoint is rate limited to 1 request per minute. Cache/search work should respect that limit.
 - `sync_nodes` replaces the remote cache for the current Workflowy API key. Search results include cache freshness metadata.
+- Backup tools are intentionally not included in the remote server yet. This project is focused on remote read/write/search and first-run setup.
 - This first remote version intentionally does not store your Workflowy API key. Future hosted/multi-user versions should use a more complete authorization flow.

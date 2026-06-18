@@ -1046,6 +1046,18 @@ const handler = createMcpHandler(
     );
 
     server.tool(
+      "cache_status",
+      "Show Neon-backed Workflowy cache status for the current Workflowy API key.",
+      {},
+      async (_args, extra) => {
+        const apiKey = getApiKey(extra);
+        const accountKey = accountKeyFromApiKey(apiKey);
+        const sql = await getDb();
+        return jsonContent(await getCacheStatus(sql, accountKey));
+      },
+    );
+
+    server.tool(
       "get_targets",
       "Get special Workflowy targets such as inbox and home.",
       {},
