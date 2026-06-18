@@ -1,6 +1,11 @@
 "use client";
 
 import { type FormEvent, useEffect, useRef, useState } from "react";
+import {
+  DEFAULT_TOOL_DESCRIPTIONS,
+  MCP_TOOL_NAMES,
+  type McpToolName,
+} from "./lib/mcp-defaults";
 import styles from "./page.module.css";
 
 type Section = "connection" | "setup" | "tools" | "bookmarks" | "cache" | "diagnostics";
@@ -36,6 +41,16 @@ interface AdminStatus {
   database_configured: boolean;
 }
 
+interface McpSettingsPayload {
+  account_id: string;
+  server_instructions: string | null;
+  tool_descriptions: Partial<Record<McpToolName, string>>;
+  default_server_instructions: string;
+  default_tool_descriptions: Record<McpToolName, string>;
+  tool_names: McpToolName[];
+  updated_at: string | null;
+}
+
 interface ActivityLog {
   id: number;
   type: LogType;
@@ -68,6 +83,12 @@ interface SearchPayload {
   }>;
   total_found?: number;
   cache_status?: CacheStatus;
+  auto_sync?: {
+    attempted: boolean;
+    synced: boolean;
+    error?: string;
+    cache_status?: CacheStatus;
+  };
   error?: string;
 }
 
@@ -184,6 +205,12 @@ export default function Home() {
   const [endpoint, setEndpoint] = useState("");
   const [connectionStatus, setConnectionStatus] = useState<"idle" | "checking" | "connected" | "failed">("idle");
   const [tools, setTools] = useState<ToolInfo[]>([]);
+  const [mcpSettings, setMcpSettings] = useState<McpSettingsPayload | null>(null);
+  const [serverInstructionsDraft, setServerInstructionsDraft] = useState("");
+  const [toolDescriptionDrafts, setToolDescriptionDrafts] = useState<
+    Partial<Record<McpToolName, string>>
+  >({});
+  const [expandedTools, setExpandedTools] = useState<Set<McpToolName>>(new Set());
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
   const [activity, setActivity] = useState<ActivityLog[]>([]);
@@ -219,6 +246,19 @@ export default function Home() {
       : !adminStatus.admin_configured || (isAuthenticated && !serverReady)
         ? "failed"
         : connectionStatus;
+  const settingsToolNames = mcpSettings?.tool_names ?? MCP_TOOL_NAMES;
+  const defaultToolDescriptions =
+    mcpSettings?.default_tool_descriptions ?? DEFAULT_TOOL_DESCRIPTIONS;
+  const hasSettingsChanges = Boolean(
+    mcpSettings &&
+      (serverInstructionsDraft.trim() !==
+        (mcpSettings.server_instructions ?? mcpSettings.default_server_instructions).trim() ||
+        settingsToolNames.some(
+          (name) =>
+            (toolDescriptionDrafts[name] ?? defaultToolDescriptions[name]).trim() !==
+            (mcpSettings.tool_descriptions[name] ?? defaultToolDescriptions[name]).trim(),
+        )),
+  );
 
   function addLog(type: LogType, message: string): void {
     setActivity((current) => [
@@ -243,6 +283,10 @@ export default function Home() {
       if (!status.authenticated) {
         setConnectionStatus("idle");
         setTools([]);
+        setMcpSettings(null);
+        setServerInstructionsDraft("");
+        setToolDescriptionDrafts({});
+        setExpandedTools(new Set());
         setBookmarks([]);
         setCacheStatus(null);
         setSearchResults([]);
@@ -276,6 +320,7 @@ export default function Home() {
       setAdminSecret("");
       setAuthMessage("");
       addLog("success", "Admin console unlocked.");
+      await refreshMcpSettings(false);
     } catch (error) {
       setAuthMessage(error instanceof Error ? error.message : String(error));
     } finally {
@@ -297,6 +342,10 @@ export default function Home() {
       );
       setConnectionStatus("idle");
       setTools([]);
+      setMcpSettings(null);
+      setServerInstructionsDraft("");
+      setToolDescriptionDrafts({});
+      setExpandedTools(new Set());
       setBookmarks([]);
       setCacheStatus(null);
       setSearchResults([]);
@@ -368,12 +417,141 @@ export default function Home() {
       );
       await refreshCacheStatus(false);
       await refreshBookmarks(false);
+      await refreshMcpSettings(false);
     } catch (error) {
       setConnectionStatus("failed");
       addLog("error", error instanceof Error ? error.message : String(error));
     } finally {
       setIsBusy(false);
     }
+  }
+
+  async function refreshMcpSettings(showLog = true): Promise<void> {
+    try {
+      const response = await fetch("/api/admin/settings", {
+        credentials: "same-origin",
+      });
+      const data = (await response.json()) as McpSettingsPayload & {
+        error?: { message?: string } | string;
+      };
+      if (!response.ok) {
+        const message =
+          typeof data.error === "string"
+            ? data.error
+            : data.error?.message || `HTTP ${response.status}`;
+        throw new Error(message);
+      }
+
+      setMcpSettings(data);
+      setServerInstructionsDraft(
+        data.server_instructions ?? data.default_server_instructions,
+      );
+      setToolDescriptionDrafts({
+        ...data.default_tool_descriptions,
+        ...data.tool_descriptions,
+      });
+      if (showLog) {
+        addLog("success", "MCP instructions loaded.");
+      }
+    } catch (error) {
+      if (showLog) {
+        addLog("error", error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
+
+  function toolDescriptionOverrides(): Partial<Record<McpToolName, string>> {
+    const overrides: Partial<Record<McpToolName, string>> = {};
+
+    for (const name of settingsToolNames) {
+      const value = (toolDescriptionDrafts[name] ?? "").trim();
+      if (value && value !== defaultToolDescriptions[name]) {
+        overrides[name] = value;
+      }
+    }
+
+    return overrides;
+  }
+
+  async function saveMcpSettings(): Promise<void> {
+    setIsBusy(true);
+    try {
+      const response = await fetch("/api/admin/settings", {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          server_instructions: serverInstructionsDraft,
+          tool_descriptions: toolDescriptionOverrides(),
+        }),
+      });
+      const data = (await response.json()) as McpSettingsPayload & {
+        error?: { message?: string } | string;
+      };
+      if (!response.ok) {
+        const message =
+          typeof data.error === "string"
+            ? data.error
+            : data.error?.message || `HTTP ${response.status}`;
+        throw new Error(message);
+      }
+
+      setMcpSettings(data);
+      setServerInstructionsDraft(
+        data.server_instructions ?? data.default_server_instructions,
+      );
+      setToolDescriptionDrafts({
+        ...data.default_tool_descriptions,
+        ...data.tool_descriptions,
+      });
+      addLog("success", "MCP instructions saved.");
+      if (connectionStatus === "connected") {
+        await testConnection();
+      }
+    } catch (error) {
+      addLog("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  function resetServerInstructions(): void {
+    if (mcpSettings) {
+      setServerInstructionsDraft(mcpSettings.default_server_instructions);
+    }
+  }
+
+  function updateToolDescription(name: McpToolName, value: string): void {
+    setToolDescriptionDrafts((current) => ({
+      ...current,
+      [name]: value,
+    }));
+  }
+
+  function resetToolDescription(name: McpToolName): void {
+    setToolDescriptionDrafts((current) => ({
+      ...current,
+      [name]: defaultToolDescriptions[name],
+    }));
+  }
+
+  function toggleToolExpanded(name: McpToolName): void {
+    setExpandedTools((current) => {
+      const next = new Set(current);
+      if (next.has(name)) {
+        next.delete(name);
+      } else {
+        next.add(name);
+      }
+      return next;
+    });
+  }
+
+  function isToolCustomized(name: McpToolName): boolean {
+    return (
+      (toolDescriptionDrafts[name] ?? defaultToolDescriptions[name]).trim() !==
+      defaultToolDescriptions[name].trim()
+    );
   }
 
   async function refreshBookmarks(showLog = true): Promise<void> {
@@ -469,6 +647,14 @@ export default function Home() {
       setSearchResults(result.results ?? []);
       if (result.cache_status) {
         setCacheStatus(result.cache_status);
+      }
+      if (result.auto_sync?.attempted) {
+        addLog(
+          result.auto_sync.synced ? "success" : "warning",
+          result.auto_sync.synced
+            ? "Cache auto-synced before search."
+            : `Auto-sync skipped: ${result.auto_sync.error || "using existing cache."}`,
+        );
       }
       if (result.error) {
         addLog("warning", result.error);
@@ -749,7 +935,63 @@ export default function Home() {
 
           {activeSection === "tools" && (
             <>
-              <Header title="Tools" subtitle="Inspect the active remote MCP tool surface." />
+              <Header title="Tools" subtitle="Customize how AI clients understand and use the hosted Workflowy tools." />
+              <div className={styles.panel}>
+                <label className={styles.inputGroup}>
+                  <span>Server Instructions</span>
+                  <textarea
+                    value={serverInstructionsDraft}
+                    onChange={(event) => setServerInstructionsDraft(event.target.value)}
+                    rows={12}
+                    placeholder={mcpSettings?.default_server_instructions ?? "Load settings to edit instructions."}
+                  />
+                </label>
+                <div className={styles.buttonRow}>
+                  <button className={styles.primaryButton} onClick={saveMcpSettings} disabled={isBusy || !mcpSettings || !hasSettingsChanges} type="button">
+                    Save Customizations
+                  </button>
+                  <button className={styles.secondaryButton} onClick={resetServerInstructions} disabled={isBusy || !mcpSettings} type="button">
+                    Reset Instructions
+                  </button>
+                  <button className={styles.secondaryButton} onClick={() => refreshMcpSettings()} disabled={isBusy} type="button">
+                    Reload Settings
+                  </button>
+                </div>
+              </div>
+
+              <div className={styles.panel}>
+                <div className={styles.sectionHeaderRow}>
+                  <h2>Tool Descriptions</h2>
+                  <button className={styles.secondaryButton} onClick={saveMcpSettings} disabled={isBusy || !mcpSettings || !hasSettingsChanges} type="button">
+                    Save
+                  </button>
+                </div>
+                <div className={styles.toolEditorList}>
+                  {settingsToolNames.map((name) => (
+                    <article key={name} className={styles.toolEditorItem}>
+                      <button className={styles.toolEditorHeader} onClick={() => toggleToolExpanded(name)} type="button">
+                        <span>{expandedTools.has(name) ? "▾" : "▸"}</span>
+                        <strong>{name}</strong>
+                        {isToolCustomized(name) && <em>customized</em>}
+                      </button>
+                      {expandedTools.has(name) && (
+                        <div className={styles.toolEditorBody}>
+                          <textarea
+                            value={toolDescriptionDrafts[name] ?? defaultToolDescriptions[name]}
+                            onChange={(event) => updateToolDescription(name, event.target.value)}
+                            rows={4}
+                          />
+                          <button className={styles.secondaryButton} onClick={() => resetToolDescription(name)} disabled={!isToolCustomized(name)} type="button">
+                            Reset
+                          </button>
+                        </div>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              </div>
+
+              <Header title="Active Tools" subtitle="The tool metadata returned by the deployed MCP endpoint." />
               <div className={styles.buttonRow}>
                 <button className={styles.secondaryButton} onClick={testConnection} disabled={isBusy || !canCallMcp} type="button">
                   Reload Tools

@@ -1,8 +1,21 @@
 import { createHash } from "crypto";
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import type { RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  InitializeRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import { z } from "zod";
+import {
+  AI_INSTRUCTIONS_BOOKMARK,
+  DEFAULT_SERVER_INSTRUCTIONS,
+  DEFAULT_TOOL_DESCRIPTIONS,
+  LINE_TYPES,
+  sanitizeToolDescriptions,
+  type McpToolName,
+} from "../../lib/mcp-defaults";
 import {
   getMcpAccessSecret,
   getWorkflowyApiKey,
@@ -13,18 +26,6 @@ export const runtime = "nodejs";
 
 const WORKFLOWY_API_BASE = "https://workflowy.com";
 const LLM_DOC_API_BASE = "https://beta.workflowy.com";
-const AI_INSTRUCTIONS_BOOKMARK = "ai_instructions";
-const LINE_TYPES = [
-  "todo",
-  "h1",
-  "h2",
-  "h3",
-  "p",
-  "bullets",
-  "code",
-  "quote",
-  "table",
-] as const;
 const EXPORT_RATE_LIMIT_MS = 60 * 1000;
 const STALE_SYNC_LOCK_MS = 5 * 60 * 1000;
 const CACHE_STALE_MS = 60 * 60 * 1000;
@@ -63,7 +64,13 @@ interface CachedNodeRow {
   relevance_score?: number;
 }
 
+interface McpSettings {
+  server_instructions: string | null;
+  tool_descriptions: Partial<Record<McpToolName, string>>;
+}
+
 let dbPromise: Promise<SqlClient> | undefined;
+const registeredTools: Partial<Record<McpToolName, RegisteredTool>> = {};
 
 async function getDb(): Promise<SqlClient> {
   if (dbPromise) {
@@ -114,6 +121,14 @@ async function getDb(): Promise<SqlClient> {
       )
     `;
     await sql`
+      CREATE TABLE IF NOT EXISTS workflowy_mcp_settings (
+        account_key TEXT PRIMARY KEY,
+        server_instructions TEXT,
+        tool_descriptions JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`
       CREATE INDEX IF NOT EXISTS idx_workflowy_nodes_parent
       ON workflowy_nodes (account_key, parent_id, priority)
     `;
@@ -143,6 +158,19 @@ function textContent(text: string): ToolResponse {
   return { content: [{ type: "text", text }] };
 }
 
+function parseJsonContent(value: ToolResponse): unknown {
+  const text = value.content.find((item) => item.type === "text")?.text;
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -156,6 +184,66 @@ function getApiKey(extra: { authInfo?: AuthInfo }): string {
 
 function accountKeyFromApiKey(apiKey: string): string {
   return createHash("sha256").update(apiKey).digest("hex");
+}
+
+async function getMcpSettings(
+  sql: SqlClient,
+  accountKey: string,
+): Promise<McpSettings> {
+  const rows = await sql`
+    SELECT server_instructions, tool_descriptions
+    FROM workflowy_mcp_settings
+    WHERE account_key = ${accountKey}
+  `;
+  const row = rows[0];
+
+  return {
+    server_instructions:
+      typeof row?.server_instructions === "string" && row.server_instructions.trim()
+        ? row.server_instructions
+        : null,
+    tool_descriptions: sanitizeToolDescriptions(
+      isRecord(row?.tool_descriptions) ? row.tool_descriptions : null,
+    ),
+  };
+}
+
+function toolDescription(
+  settings: McpSettings,
+  name: McpToolName,
+): string {
+  return settings.tool_descriptions[name] || DEFAULT_TOOL_DESCRIPTIONS[name];
+}
+
+async function getSettingsForApiKey(apiKey: string): Promise<{
+  sql: SqlClient;
+  accountKey: string;
+  settings: McpSettings;
+}> {
+  const sql = await getDb();
+  const accountKey = accountKeyFromApiKey(apiKey);
+  const settings = await getMcpSettings(sql, accountKey);
+  return { sql, accountKey, settings };
+}
+
+function updateRegisteredToolDescriptions(settings: McpSettings): void {
+  for (const [name, tool] of Object.entries(registeredTools) as Array<
+    [McpToolName, RegisteredTool | undefined]
+  >) {
+    tool?.update({ description: toolDescription(settings, name) });
+  }
+}
+
+async function refreshRegisteredToolDescriptions(apiKey: string): Promise<void> {
+  const { settings } = await getSettingsForApiKey(apiKey);
+  updateRegisteredToolDescriptions(settings);
+}
+
+function updateServerInstructions(
+  server: { _instructions?: string },
+  instructions: string,
+): void {
+  server._instructions = instructions;
 }
 
 function normalizeNodeId(value: string): string {
@@ -270,6 +358,11 @@ async function getCacheStatus(sql: SqlClient, accountKey: string) {
     is_stale: cacheIsStale,
     sync_in_progress: syncInProgress === "true",
   };
+}
+
+async function markCacheStale(sql: SqlClient, accountKey: string): Promise<void> {
+  const staleTimestamp = new Date(Date.now() - CACHE_STALE_MS - 1000).toISOString();
+  await setSyncMeta(sql, accountKey, "last_full_sync", staleTimestamp);
 }
 
 async function fetchNodesExport(apiKey: string): Promise<WorkflowyExportResponse> {
@@ -447,6 +540,32 @@ async function performFullSync(apiKey: string, accountKey: string): Promise<{
   }
 }
 
+async function ensureCacheFresh(apiKey: string, accountKey: string): Promise<{
+  attempted: boolean;
+  synced: boolean;
+  error?: string;
+  cache_status: Awaited<ReturnType<typeof getCacheStatus>>;
+}> {
+  const sql = await getDb();
+  const cacheStatus = await getCacheStatus(sql, accountKey);
+
+  if (cacheStatus.node_count > 0 && !cacheStatus.is_stale) {
+    return {
+      attempted: false,
+      synced: false,
+      cache_status: cacheStatus,
+    };
+  }
+
+  const syncResult = await performFullSync(apiKey, accountKey);
+  return {
+    attempted: true,
+    synced: Boolean(syncResult.success),
+    error: syncResult.error,
+    cache_status: syncResult.cache_status ?? (await getCacheStatus(sql, accountKey)),
+  };
+}
+
 async function buildNodePath(
   sql: SqlClient,
   accountKey: string,
@@ -534,22 +653,28 @@ async function formatSearchResults(
 }
 
 async function searchCachedNodes({
+  apiKey,
   accountKey,
   query,
   includeCompleted,
   limit,
 }: {
+  apiKey: string;
   accountKey: string;
   query: string;
   includeCompleted: boolean;
   limit: number;
 }) {
   const sql = await getDb();
-  const cacheStatus = await getCacheStatus(sql, accountKey);
+  const autoSync = await ensureCacheFresh(apiKey, accountKey);
+  const cacheStatus = autoSync.cache_status;
   if (cacheStatus.node_count === 0) {
     return {
-      error: "Cache is empty. Run sync_nodes first.",
+      error: autoSync.error
+        ? `Cache is empty and auto-sync failed: ${autoSync.error}`
+        : "Cache is empty. Run sync_nodes first.",
       cache_status: cacheStatus,
+      auto_sync: autoSync,
       results: [],
     };
   }
@@ -560,6 +685,7 @@ async function searchCachedNodes({
     return {
       error: "query must contain at least one searchable word",
       cache_status: cacheStatus,
+      auto_sync: autoSync,
       results: [],
     };
   }
@@ -594,7 +720,363 @@ async function searchCachedNodes({
 
   return {
     cache_status: cacheStatus,
+    auto_sync: autoSync,
     results: await formatSearchResults(sql, accountKey, rows),
+  };
+}
+
+function normalizeNodeApiParentId(
+  parentId: string | null | undefined,
+): string | null | undefined {
+  if (parentId === undefined) return undefined;
+  if (parentId === null || parentId === "None") return null;
+  if (parentId === "inbox" || parentId === "home") return parentId;
+  if (
+    parentId === "today" ||
+    parentId === "tomorrow" ||
+    parentId === "next_week" ||
+    /^\d{4}(?:-\d{2}){0,2}$/.test(parentId)
+  ) {
+    return undefined;
+  }
+
+  return parentId;
+}
+
+function encodeSyncTarget(parentId: string | null): string {
+  return parentId === null ? "__ROOT__" : parentId;
+}
+
+function decodeSyncTarget(parentId: string): string | null {
+  return parentId === "__ROOT__" ? null : parentId;
+}
+
+async function getCachedParentId(
+  sql: SqlClient,
+  accountKey: string,
+  nodeId: string,
+): Promise<string | null | undefined> {
+  const rows = await sql`
+    SELECT parent_id
+    FROM workflowy_nodes
+    WHERE account_key = ${accountKey} AND id = ${nodeId}
+  `;
+
+  if (rows.length === 0) {
+    return undefined;
+  }
+
+  return typeof rows[0].parent_id === "string" ? rows[0].parent_id : null;
+}
+
+async function deleteNodeFromCache(
+  sql: SqlClient,
+  accountKey: string,
+  nodeId: string,
+): Promise<void> {
+  await sql`
+    WITH RECURSIVE descendants AS (
+      SELECT id
+      FROM workflowy_nodes
+      WHERE account_key = ${accountKey} AND id = ${nodeId}
+
+      UNION ALL
+
+      SELECT child.id
+      FROM workflowy_nodes child
+      JOIN descendants ON child.parent_id = descendants.id
+      WHERE child.account_key = ${accountKey}
+    )
+    DELETE FROM workflowy_nodes
+    WHERE account_key = ${accountKey}
+      AND id IN (SELECT id FROM descendants)
+  `;
+}
+
+async function syncSingleNode(
+  apiKey: string,
+  accountKey: string,
+  nodeId: string,
+  parentIdOverride?: string | null,
+): Promise<{ success: boolean; error?: string }> {
+  const sql = await getDb();
+  const result = await workflowyJsonRequest(
+    apiKey,
+    `${WORKFLOWY_API_BASE}/api/v1/nodes/${encodeURIComponent(nodeId)}`,
+    { method: "GET" },
+  );
+
+  if (!result.ok) {
+    if (result.status === 404) {
+      await deleteNodeFromCache(sql, accountKey, nodeId);
+      return { success: true };
+    }
+
+    return {
+      success: false,
+      error: `Workflowy node refresh failed with HTTP ${result.status}`,
+    };
+  }
+
+  if (!isRecord(result.data) || !isRecord(result.data.node)) {
+    return { success: false, error: "Workflowy node refresh returned no node." };
+  }
+
+  const node = result.data.node as unknown as WorkflowyExportNode;
+  if (!node.id) {
+    return { success: false, error: "Workflowy node refresh returned a node without an id." };
+  }
+
+  const existing = await sql`
+    SELECT parent_id, children_count
+    FROM workflowy_nodes
+    WHERE account_key = ${accountKey} AND id = ${node.id}
+  `;
+  const cachedParentId =
+    typeof existing[0]?.parent_id === "string" ? existing[0].parent_id : null;
+  const parentId =
+    parentIdOverride !== undefined ? parentIdOverride : cachedParentId;
+  const childrenCount = Number(existing[0]?.children_count ?? 0);
+
+  await sql`
+    INSERT INTO workflowy_nodes (
+      account_key,
+      id,
+      name,
+      note,
+      parent_id,
+      completed,
+      children_count,
+      priority,
+      created_at,
+      updated_at,
+      completed_at
+    )
+    VALUES (
+      ${accountKey},
+      ${node.id},
+      ${node.name ?? ""},
+      ${node.note ?? null},
+      ${parentId},
+      ${Boolean(node.completed || node.completedAt)},
+      ${childrenCount},
+      ${node.priority ?? 0},
+      ${toIsoFromWorkflowyTimestamp(node.createdAt)},
+      ${toIsoFromWorkflowyTimestamp(node.modifiedAt)},
+      ${toIsoFromWorkflowyTimestamp(node.completedAt)}
+    )
+    ON CONFLICT (account_key, id)
+    DO UPDATE SET
+      name = EXCLUDED.name,
+      note = EXCLUDED.note,
+      parent_id = EXCLUDED.parent_id,
+      completed = EXCLUDED.completed,
+      priority = EXCLUDED.priority,
+      created_at = EXCLUDED.created_at,
+      updated_at = EXCLUDED.updated_at,
+      completed_at = EXCLUDED.completed_at
+  `;
+
+  return { success: true };
+}
+
+async function syncNodeChildren(
+  apiKey: string,
+  accountKey: string,
+  parentId: string | null,
+): Promise<{ success: boolean; error?: string; nodes_synced?: number }> {
+  const sql = await getDb();
+  const parentQuery =
+    parentId === null
+      ? "None"
+      : parentId;
+  const result = await workflowyJsonRequest(
+    apiKey,
+    `${WORKFLOWY_API_BASE}/api/v1/nodes?parent_id=${encodeURIComponent(parentQuery)}`,
+    { method: "GET" },
+  );
+
+  if (!result.ok) {
+    return {
+      success: false,
+      error: `Workflowy children refresh failed with HTTP ${result.status}`,
+    };
+  }
+
+  if (!isRecord(result.data) || !Array.isArray(result.data.nodes)) {
+    return { success: false, error: "Workflowy children refresh returned no nodes." };
+  }
+
+  const nodes = result.data.nodes as WorkflowyExportNode[];
+  const existingRows =
+    parentId === null
+      ? await sql`
+          SELECT id
+          FROM workflowy_nodes
+          WHERE account_key = ${accountKey} AND parent_id IS NULL
+        `
+      : await sql`
+          SELECT id
+          FROM workflowy_nodes
+          WHERE account_key = ${accountKey} AND parent_id = ${parentId}
+        `;
+  const existingIds = new Set(existingRows.map((row) => String(row.id)));
+  const seenIds = new Set<string>();
+
+  for (const node of nodes) {
+    if (!node.id) {
+      continue;
+    }
+
+    seenIds.add(node.id);
+    await sql`
+      INSERT INTO workflowy_nodes (
+        account_key,
+        id,
+        name,
+        note,
+        parent_id,
+        completed,
+        children_count,
+        priority,
+        created_at,
+        updated_at,
+        completed_at
+      )
+      VALUES (
+        ${accountKey},
+        ${node.id},
+        ${node.name ?? ""},
+        ${node.note ?? null},
+        ${parentId},
+        ${Boolean(node.completed || node.completedAt)},
+        0,
+        ${node.priority ?? 0},
+        ${toIsoFromWorkflowyTimestamp(node.createdAt)},
+        ${toIsoFromWorkflowyTimestamp(node.modifiedAt)},
+        ${toIsoFromWorkflowyTimestamp(node.completedAt)}
+      )
+      ON CONFLICT (account_key, id)
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        note = EXCLUDED.note,
+        parent_id = EXCLUDED.parent_id,
+        completed = EXCLUDED.completed,
+        priority = EXCLUDED.priority,
+        created_at = EXCLUDED.created_at,
+        updated_at = EXCLUDED.updated_at,
+        completed_at = EXCLUDED.completed_at
+    `;
+  }
+
+  for (const existingId of existingIds) {
+    if (!seenIds.has(existingId)) {
+      await deleteNodeFromCache(sql, accountKey, existingId);
+    }
+  }
+
+  if (parentId && isConcreteNodeId(parentId)) {
+    await sql`
+      UPDATE workflowy_nodes
+      SET children_count = ${nodes.length}
+      WHERE account_key = ${accountKey} AND id = ${parentId}
+    `;
+  }
+
+  return { success: true, nodes_synced: nodes.length };
+}
+
+async function refreshCacheAfterEdit(
+  apiKey: string,
+  accountKey: string,
+  root: string,
+  operations: LlmDocOperation[],
+): Promise<{
+  stale_marked: boolean;
+  parent_targets_refreshed: number;
+  nodes_refreshed: number;
+  errors: string[];
+}> {
+  const sql = await getDb();
+  await markCacheStale(sql, accountKey);
+
+  const parentTargets = new Set<string>();
+  const nodeSyncRequests = new Map<string, string | null | undefined>();
+  const errors: string[] = [];
+
+  const addParentTarget = (parentId: string | null | undefined): void => {
+    const normalized = normalizeNodeApiParentId(parentId);
+    if (normalized !== undefined) {
+      parentTargets.add(encodeSyncTarget(normalized));
+    }
+  };
+
+  for (const operation of operations) {
+    if (operation.op === "insert") {
+      if (operation.under !== undefined) {
+        addParentTarget(operation.under);
+      } else if (operation.after) {
+        addParentTarget(await getCachedParentId(sql, accountKey, operation.after));
+      } else {
+        addParentTarget(root);
+      }
+      continue;
+    }
+
+    if (!operation.ref) {
+      continue;
+    }
+
+    const cachedParentId = await getCachedParentId(sql, accountKey, operation.ref);
+
+    if (operation.op === "update") {
+      nodeSyncRequests.set(operation.ref, undefined);
+      continue;
+    }
+
+    if (operation.op === "delete") {
+      addParentTarget(cachedParentId);
+      nodeSyncRequests.set(operation.ref, undefined);
+      continue;
+    }
+
+    if (operation.op === "move") {
+      const newParentId = normalizeNodeApiParentId(operation.under);
+      addParentTarget(newParentId);
+      nodeSyncRequests.set(operation.ref, newParentId);
+    }
+  }
+
+  let parentTargetsRefreshed = 0;
+  let nodesRefreshed = 0;
+
+  for (const parentTarget of parentTargets) {
+    const result = await syncNodeChildren(
+      apiKey,
+      accountKey,
+      decodeSyncTarget(parentTarget),
+    );
+    if (result.success) {
+      parentTargetsRefreshed += 1;
+    } else if (result.error) {
+      errors.push(result.error);
+    }
+  }
+
+  for (const [nodeId, parentIdOverride] of nodeSyncRequests.entries()) {
+    const result = await syncSingleNode(apiKey, accountKey, nodeId, parentIdOverride);
+    if (result.success) {
+      nodesRefreshed += 1;
+    } else if (result.error) {
+      errors.push(result.error);
+    }
+  }
+
+  return {
+    stale_marked: true,
+    parent_targets_refreshed: parentTargetsRefreshed,
+    nodes_refreshed: nodesRefreshed,
+    errors,
   };
 }
 
@@ -862,30 +1344,38 @@ async function readUserInstructions(
   return outline || `(${AI_INSTRUCTIONS_BOOKMARK} returned no readable text)`;
 }
 
-const serverInstructions = `This MCP server connects to a user's Workflowy account from a remote self-hosted deployment.
+async function buildServerInstructions(apiKey: string): Promise<string> {
+  const { sql, accountKey, settings } = await getSettingsForApiKey(apiKey);
+  let instructions = settings.server_instructions || DEFAULT_SERVER_INSTRUCTIONS;
 
-## Start Here
-1. Call list_bookmarks first. It returns saved Workflowy locations and user instructions when configured.
-2. Use read_doc for current Workflowy content. Use edit_doc for batched changes.
-3. Prefer one read_doc followed by one edit_doc with all needed operations.
-4. Use search_nodes when you do not know where something is. If the cache is empty, call sync_nodes first.
+  instructions += `\n\n## Hosted Deployment\nThis is the remote self-hosted Workflowy MCP. Credentials are server-side, bookmarks and cache are stored in Neon, and backups/desktop controls are intentionally unavailable here.`;
 
-## Node IDs
-- Use 12-character Workflowy tags, full UUIDs, or special targets: today, tomorrow, next_week, inbox, None.
-- If the user shares a Workflowy link, extract the 12-hex ID after #/.
+  const bookmarks = await sql`
+    SELECT name, node_id
+    FROM workflowy_bookmarks
+    WHERE account_key = ${accountKey}
+    ORDER BY name
+  `;
+  const aiInstructionsBookmark = bookmarks.find(
+    (bookmark) => bookmark.name === AI_INSTRUCTIONS_BOOKMARK,
+  );
 
-## edit_doc
-- insert: use exactly one of under or after, and provide items.
-- update: provide ref and to.
-- delete: provide ref.
-- move: provide ref and under.
-- Items use n for text, d for notes, l for line type, x for completion, and c for children.`;
+  if (aiInstructionsBookmark) {
+    const userInstructions = await readUserInstructions(
+      apiKey,
+      String(aiInstructionsBookmark.node_id),
+    );
+    instructions += `\n\n## User's Custom Instructions\nThe user has configured the following custom instructions in their Workflowy "${AI_INSTRUCTIONS_BOOKMARK}" bookmark. Follow these preferences:\n\n${userInstructions}`;
+  }
+
+  return instructions;
+}
 
 const handler = createMcpHandler(
-  (server) => {
-    server.tool(
+  async (server) => {
+    registeredTools.list_bookmarks = server.tool(
       "list_bookmarks",
-      "List saved Workflowy bookmarks and user instructions. Call this at the start of every conversation.",
+      DEFAULT_TOOL_DESCRIPTIONS.list_bookmarks,
       {},
       async (_args, extra) => {
         const apiKey = getApiKey(extra);
@@ -920,9 +1410,9 @@ const handler = createMcpHandler(
       },
     );
 
-    server.tool(
+    registeredTools.save_bookmark = server.tool(
       "save_bookmark",
-      "Save a Workflowy node ID with a friendly name and context notes for future sessions.",
+      DEFAULT_TOOL_DESCRIPTIONS.save_bookmark,
       {
         name: z
           .string()
@@ -969,9 +1459,9 @@ const handler = createMcpHandler(
       },
     );
 
-    server.tool(
+    registeredTools.delete_bookmark = server.tool(
       "delete_bookmark",
-      "Delete a saved bookmark by name.",
+      DEFAULT_TOOL_DESCRIPTIONS.delete_bookmark,
       {
         name: z.string().min(1).describe("The bookmark name to delete"),
       },
@@ -993,9 +1483,9 @@ const handler = createMcpHandler(
       },
     );
 
-    server.tool(
+    registeredTools.read_doc = server.tool(
       "read_doc",
-      "Read a Workflowy node and its children using the LLM Doc API. Returns tag-as-key JSON.",
+      DEFAULT_TOOL_DESCRIPTIONS.read_doc,
       {
         node_id: z
           .string()
@@ -1014,9 +1504,9 @@ const handler = createMcpHandler(
       ) => llmDocRead(getApiKey(extra), node_id, depth),
     );
 
-    server.tool(
+    registeredTools.edit_doc = server.tool(
       "edit_doc",
-      "Edit Workflowy nodes using the LLM Doc API. Supports insert, update, delete, and move in one batched request.",
+      DEFAULT_TOOL_DESCRIPTIONS.edit_doc,
       {
         root: z
           .string()
@@ -1033,12 +1523,32 @@ const handler = createMcpHandler(
           operations,
         }: { root: string; operations: LlmDocOperation[] },
         extra,
-      ) => llmDocEdit(getApiKey(extra), root, operations),
+      ) => {
+        const apiKey = getApiKey(extra);
+        const accountKey = accountKeyFromApiKey(apiKey);
+        const editResponse = await llmDocEdit(apiKey, root, operations);
+        const payload = parseJsonContent(editResponse);
+
+        if (isRecord(payload) && payload.success === true) {
+          const cacheRefresh = await refreshCacheAfterEdit(
+            apiKey,
+            accountKey,
+            root,
+            operations,
+          );
+          return jsonContent({
+            ...payload,
+            cache_refresh: cacheRefresh,
+          });
+        }
+
+        return editResponse;
+      },
     );
 
-    server.tool(
+    registeredTools.search_nodes = server.tool(
       "search_nodes",
-      "Search the Neon-backed Workflowy cache by text. Run sync_nodes first if the cache is empty.",
+      DEFAULT_TOOL_DESCRIPTIONS.search_nodes,
       {
         query: z.string().min(1).describe("Text to search for"),
         include_completed: z
@@ -1062,6 +1572,7 @@ const handler = createMcpHandler(
         const accountKey = accountKeyFromApiKey(apiKey);
         const safeLimit = Math.min(Math.max(Math.trunc(limit ?? 10), 1), 100);
         const result = await searchCachedNodes({
+          apiKey,
           accountKey,
           query,
           includeCompleted: include_completed ?? false,
@@ -1073,14 +1584,15 @@ const handler = createMcpHandler(
           results: result.results,
           total_found: result.results.length,
           cache_status: result.cache_status,
+          auto_sync: result.auto_sync,
           error: result.error,
         });
       },
     );
 
-    server.tool(
+    registeredTools.sync_nodes = server.tool(
       "sync_nodes",
-      "Fetch the full Workflowy nodes export and replace the Neon-backed search cache. Rate limited to one export per minute.",
+      DEFAULT_TOOL_DESCRIPTIONS.sync_nodes,
       {},
       async (_args, extra) => {
         const apiKey = getApiKey(extra);
@@ -1089,9 +1601,9 @@ const handler = createMcpHandler(
       },
     );
 
-    server.tool(
+    registeredTools.cache_status = server.tool(
       "cache_status",
-      "Show Neon-backed Workflowy cache status for the current Workflowy API key.",
+      DEFAULT_TOOL_DESCRIPTIONS.cache_status,
       {},
       async (_args, extra) => {
         const apiKey = getApiKey(extra);
@@ -1101,9 +1613,9 @@ const handler = createMcpHandler(
       },
     );
 
-    server.tool(
+    registeredTools.get_targets = server.tool(
       "get_targets",
-      "Get special Workflowy targets such as inbox and home.",
+      DEFAULT_TOOL_DESCRIPTIONS.get_targets,
       {},
       async (_args, extra) => {
         try {
@@ -1122,8 +1634,82 @@ const handler = createMcpHandler(
         }
       },
     );
+
+    server.prompt(
+      "server_instructions",
+      "Get the current Workflowy MCP instructions, hosted deployment notes, and user's ai_instructions content when configured.",
+      async (extra) => {
+        const apiKey = getApiKey(extra);
+        const accountKey = accountKeyFromApiKey(apiKey);
+
+        await ensureCacheFresh(apiKey, accountKey).catch(() => undefined);
+
+        return {
+          description: "Server instructions for working with Workflowy",
+          messages: [
+            {
+              role: "user",
+              content: {
+                type: "text",
+                text: await buildServerInstructions(apiKey),
+              },
+            },
+          ],
+        };
+      },
+    );
+
+    const protocolServer = (
+      server.server as unknown as {
+        _requestHandlers?: Map<
+          string,
+          (request: unknown, extra: unknown) => unknown | Promise<unknown>
+        >;
+        _instructions?: string;
+      }
+    );
+    const requestHandlers = protocolServer._requestHandlers;
+    const originalInitializeHandler = requestHandlers?.get("initialize");
+    const originalListToolsHandler = requestHandlers?.get("tools/list");
+
+    if (originalInitializeHandler) {
+      server.server.setRequestHandler(InitializeRequestSchema, async (request, extra) => {
+        try {
+          updateServerInstructions(
+            protocolServer,
+            await buildServerInstructions(getApiKey(extra)),
+          );
+        } catch {
+          updateServerInstructions(protocolServer, DEFAULT_SERVER_INSTRUCTIONS);
+        }
+
+        return (await originalInitializeHandler(request, extra)) as {
+          protocolVersion: string;
+          capabilities: unknown;
+          serverInfo: unknown;
+          instructions?: string;
+        };
+      });
+    }
+
+    if (originalListToolsHandler) {
+      server.server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
+        await refreshRegisteredToolDescriptions(getApiKey(extra)).catch(() => undefined);
+        return (await originalListToolsHandler(request, extra)) as {
+          tools: unknown[];
+        };
+      });
+    }
+
+    const envApiKey = getWorkflowyApiKey();
+    if (envApiKey) {
+      await refreshRegisteredToolDescriptions(envApiKey).catch(() => undefined);
+      await buildServerInstructions(envApiKey)
+        .then((instructions) => updateServerInstructions(protocolServer, instructions))
+        .catch(() => undefined);
+    }
   },
-  { instructions: serverInstructions },
+  { instructions: DEFAULT_SERVER_INSTRUCTIONS },
   { basePath: "/api" },
 );
 

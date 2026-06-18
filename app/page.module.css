@@ -351,6 +351,88 @@
   border-radius: 8px;
 }
 
+.sectionHeaderRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.sectionHeaderRow h2 {
+  margin: 0;
+  color: #fff;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.toolEditorList {
+  display: grid;
+  gap: 8px;
+}
+
+.toolEditorItem {
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.toolEditorHeader {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 42px;
+  padding: 0 12px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.toolEditorHeader:hover {
+  background: var(--surface-hover);
+}
+
+.toolEditorHeader strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.toolEditorHeader em {
+  color: var(--accent);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.toolEditorBody {
+  display: grid;
+  gap: 10px;
+  padding: 0 12px 12px 38px;
+}
+
+.toolEditorBody textarea {
+  width: 100%;
+  min-width: 0;
+  resize: vertical;
+  padding: 10px 12px;
+  color: var(--text);
+  background: rgba(8, 8, 18, 0.74);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+}
+
+.toolEditorBody textarea:focus {
+  border-color: rgba(165, 168, 252, 0.6);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.18);
+}
+
 .gridTwo {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
