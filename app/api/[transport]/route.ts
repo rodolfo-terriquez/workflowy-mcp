@@ -1,44 +1,111 @@
+import { createHash, timingSafeEqual } from "crypto";
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { neon } from "@neondatabase/serverless";
+import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import { z } from "zod";
 
-// Initialize database and ensure table exists
-async function getDb() {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) {
-    throw new Error("DATABASE_URL is not set in process.env");
+export const runtime = "nodejs";
+
+const WORKFLOWY_API_BASE = "https://workflowy.com";
+const LLM_DOC_API_BASE = "https://beta.workflowy.com";
+const AI_INSTRUCTIONS_BOOKMARK = "ai_instructions";
+const LINE_TYPES = [
+  "todo",
+  "h1",
+  "h2",
+  "h3",
+  "p",
+  "bullets",
+  "code",
+  "quote",
+  "table",
+] as const;
+
+type SqlClient = NeonQueryFunction<false, false>;
+type ToolResponse = { content: Array<{ type: "text"; text: string }> };
+
+let dbPromise: Promise<SqlClient> | undefined;
+
+async function getDb(): Promise<SqlClient> {
+  if (dbPromise) {
+    return dbPromise;
   }
-  const sql = neon(databaseUrl);
 
-  // Create table if it doesn't exist
-  await sql`
-    CREATE TABLE IF NOT EXISTS bookmarks (
-      name TEXT PRIMARY KEY,
-      node_id TEXT NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW()
-    )
-  `;
+  dbPromise = (async () => {
+    const databaseUrl = process.env.DATABASE_URL;
+    if (!databaseUrl) {
+      throw new Error("DATABASE_URL is not set in process.env");
+    }
 
-  return sql;
+    const sql = neon(databaseUrl);
+    await sql`
+      CREATE TABLE IF NOT EXISTS workflowy_bookmarks (
+        account_key TEXT NOT NULL,
+        name TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        context TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (account_key, name)
+      )
+    `;
+
+    return sql;
+  })();
+
+  return dbPromise;
 }
 
-// Helper function for Workflowy API requests
-async function workflowyRequest(
-  apiKey: string,
-  path: string,
-  method: "GET" | "POST" | "DELETE",
-  body?: Record<string, unknown>,
-) {
-  const url = `https://workflowy.com${path}`;
+function jsonContent(value: unknown): ToolResponse {
+  return {
+    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+  };
+}
 
+function textContent(text: string): ToolResponse {
+  return { content: [{ type: "text", text }] };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function getApiKey(extra: { authInfo?: AuthInfo }): string {
+  if (!extra.authInfo?.token) {
+    throw new Error("Workflowy API key not provided in Authorization header");
+  }
+  return extra.authInfo.token;
+}
+
+function accountKeyFromApiKey(apiKey: string): string {
+  return createHash("sha256").update(apiKey).digest("hex");
+}
+
+function normalizeNodeId(value: string): string {
+  const trimmed = value.trim();
+  const linkMatch = trimmed.match(/#\/([0-9a-f]{12})(?:\b|$)/i);
+  return linkMatch?.[1] ?? trimmed;
+}
+
+function clampDepth(depth: number | undefined): number {
+  if (!Number.isFinite(depth)) {
+    return 3;
+  }
+  return Math.min(Math.max(Math.trunc(depth ?? 3), 1), 10);
+}
+
+async function workflowyJsonRequest(
+  apiKey: string,
+  url: string,
+  init: RequestInit,
+): Promise<{ ok: boolean; status: number; data: unknown }> {
   const res = await fetch(url, {
-    method,
+    ...init,
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
+      ...(init.headers ?? {}),
     },
-    body: body ? JSON.stringify(body) : undefined,
   });
 
   const text = await res.text();
@@ -49,74 +116,337 @@ async function workflowyRequest(
     data = { raw: text };
   }
 
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify(
-          { http_status: res.status, ok: res.ok, data },
-          null,
-          2,
-        ),
-      },
-    ],
-  };
+  return { ok: res.ok, status: res.status, data };
 }
 
-// Helper to get the API key from auth context
-function getApiKey(extra: { authInfo?: AuthInfo }): string {
-  if (!extra.authInfo?.token) {
-    throw new Error("Workflowy API key not provided in Authorization header");
+async function llmDocRead(
+  apiKey: string,
+  nodeId: string,
+  depth?: number,
+): Promise<ToolResponse> {
+  try {
+    const safeDepth = clampDepth(depth);
+    const normalizedNodeId = normalizeNodeId(nodeId);
+    const url = `${LLM_DOC_API_BASE}/api/llm/doc/read/${encodeURIComponent(
+      normalizedNodeId,
+    )}/?depth=${safeDepth}`;
+    const result = await workflowyJsonRequest(apiKey, url, { method: "GET" });
+
+    if (!result.ok) {
+      return jsonContent({
+        error: true,
+        http_status: result.status,
+        message: result.data,
+      });
+    }
+
+    return jsonContent(result.data);
+  } catch (error) {
+    return jsonContent({ error: true, message: errorMessage(error) });
   }
-  return extra.authInfo.token;
 }
+
+const docItemSchema: z.ZodTypeAny = z.lazy(() =>
+  z
+    .object({
+      n: z.string().describe("Node text/name"),
+      d: z.string().optional().describe("Node note/description"),
+      l: z.enum(LINE_TYPES).optional().describe("Workflowy line type"),
+      x: z.number().optional().describe("Completion status: 1 or 0"),
+      c: z.array(docItemSchema).optional().describe("Nested child nodes"),
+    })
+    .passthrough(),
+);
+
+const operationSchema = z
+  .object({
+    op: z.enum(["insert", "update", "delete", "move"]),
+    under: z
+      .string()
+      .optional()
+      .describe("For insert/move: parent tag or target"),
+    after: z
+      .string()
+      .optional()
+      .describe("For insert: sibling tag to insert after"),
+    items: z.array(docItemSchema).optional().describe("For insert: nodes"),
+    position: z.enum(["top", "bottom"]).optional(),
+    ref: z.string().optional().describe("For update/delete/move: node tag"),
+    to: z
+      .object({
+        n: z.string().optional().describe("New node text/name"),
+        d: z.string().optional().describe("New node note/description"),
+        l: z.enum(LINE_TYPES).optional().describe("New line type"),
+        x: z.number().optional().describe("New completion status: 1 or 0"),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
+
+type LlmDocOperation = z.infer<typeof operationSchema>;
+
+function validateOperations(operations: LlmDocOperation[]): string | null {
+  if (!Array.isArray(operations) || operations.length === 0) {
+    return "operations must be a non-empty array";
+  }
+
+  for (const [index, operation] of operations.entries()) {
+    const label = `operations[${index}]`;
+    if (operation.op === "insert") {
+      const hasUnder = Boolean(operation.under);
+      const hasAfter = Boolean(operation.after);
+      if (hasUnder === hasAfter) {
+        return `${label}: insert requires exactly one of under or after`;
+      }
+      if (!operation.items?.length) {
+        return `${label}: insert requires at least one item`;
+      }
+    }
+
+    if (operation.op === "update") {
+      if (!operation.ref) {
+        return `${label}: update requires ref`;
+      }
+      if (!operation.to || Object.keys(operation.to).length === 0) {
+        return `${label}: update requires a non-empty to object`;
+      }
+    }
+
+    if (operation.op === "delete" && !operation.ref) {
+      return `${label}: delete requires ref`;
+    }
+
+    if (operation.op === "move") {
+      if (!operation.ref) {
+        return `${label}: move requires ref`;
+      }
+      if (!operation.under) {
+        return `${label}: move requires under`;
+      }
+    }
+  }
+
+  return null;
+}
+
+async function llmDocEdit(
+  apiKey: string,
+  root: string,
+  operations: LlmDocOperation[],
+): Promise<ToolResponse> {
+  const validationError = validateOperations(operations);
+  if (validationError) {
+    return jsonContent({ error: true, message: validationError });
+  }
+
+  const body = {
+    root: normalizeNodeId(root),
+    operations,
+  };
+
+  try {
+    const result = await workflowyJsonRequest(
+      apiKey,
+      `${LLM_DOC_API_BASE}/api/llm/doc/edit`,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+    );
+
+    if (!result.ok) {
+      return jsonContent({
+        error: true,
+        http_status: result.status,
+        message: result.data,
+        request: body,
+      });
+    }
+
+    return jsonContent({ success: true, response: result.data });
+  } catch (error) {
+    return jsonContent({ error: true, message: errorMessage(error), request: body });
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const NODE_META_KEYS = new Set([
+  "ancestors",
+  "c",
+  "d",
+  "l",
+  "m",
+  "x",
+  "+",
+]);
+
+function nodeTitle(node: Record<string, unknown>): string {
+  for (const [key, value] of Object.entries(node)) {
+    if (!NODE_META_KEYS.has(key) && typeof value === "string") {
+      return value;
+    }
+  }
+  return "";
+}
+
+function docToOutline(value: unknown, depth = 0): string {
+  if (!isRecord(value)) {
+    return "";
+  }
+
+  const indent = "  ".repeat(depth);
+  const title = nodeTitle(value);
+  const note = typeof value.d === "string" ? value.d : "";
+  const lines: string[] = [];
+
+  if (title) {
+    lines.push(`${indent}- ${title}${value.x === 1 ? " [completed]" : ""}`);
+  }
+
+  if (note) {
+    for (const line of note.split(/\r?\n/)) {
+      lines.push(`${indent}  ${line}`);
+    }
+  }
+
+  const children = Array.isArray(value.c) ? value.c : [];
+  for (const child of children) {
+    const childOutline = docToOutline(child, depth + 1);
+    if (childOutline) {
+      lines.push(childOutline);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+async function readUserInstructions(
+  apiKey: string,
+  nodeId: string,
+): Promise<string> {
+  const result = await workflowyJsonRequest(
+    apiKey,
+    `${LLM_DOC_API_BASE}/api/llm/doc/read/${encodeURIComponent(
+      normalizeNodeId(nodeId),
+    )}/?depth=6`,
+    { method: "GET" },
+  );
+
+  if (!result.ok) {
+    return `(Could not read ${AI_INSTRUCTIONS_BOOKMARK}: Workflowy returned ${result.status})`;
+  }
+
+  const outline = docToOutline(result.data).trim();
+  return outline || `(${AI_INSTRUCTIONS_BOOKMARK} returned no readable text)`;
+}
+
+const serverInstructions = `This MCP server connects to a user's Workflowy account from a remote self-hosted deployment.
+
+## Start Here
+1. Call list_bookmarks first. It returns saved Workflowy locations and user instructions when configured.
+2. Use read_doc for current Workflowy content. Use edit_doc for batched changes.
+3. Prefer one read_doc followed by one edit_doc with all needed operations.
+
+## Node IDs
+- Use 12-character Workflowy tags, full UUIDs, or special targets: today, tomorrow, next_week, inbox, None.
+- If the user shares a Workflowy link, extract the 12-hex ID after #/.
+
+## edit_doc
+- insert: use exactly one of under or after, and provide items.
+- update: provide ref and to.
+- delete: provide ref.
+- move: provide ref and under.
+- Items use n for text, d for notes, l for line type, x for completion, and c for children.`;
 
 const handler = createMcpHandler(
   (server) => {
-    // ==================== BOOKMARK TOOLS ====================
-
     server.tool(
-      "save_bookmark",
-      "Save a Workflowy node ID with a friendly name for easy reference later. Check similar bookmarks before creating a new one to avoid duplicates.",
-      {
-        name: z
-          .string()
-          .describe(
-            "A friendly name for the bookmark (e.g., 'special_inbox', 'work_tasks')",
-          ),
-        node_id: z.string().describe("The Workflowy node UUID to bookmark"),
-      },
-      async ({ name, node_id }: { name: string; node_id: string }, extra) => {
-        getApiKey(extra); // Ensure auth is present
+      "list_bookmarks",
+      "List saved Workflowy bookmarks and user instructions. Call this at the start of every conversation.",
+      {},
+      async (_args, extra) => {
+        const apiKey = getApiKey(extra);
+        const accountKey = accountKeyFromApiKey(apiKey);
         const sql = await getDb();
-        await sql`
-          INSERT INTO bookmarks (name, node_id)
-          VALUES (${name}, ${node_id})
-          ON CONFLICT (name) DO UPDATE SET node_id = ${node_id}
+        const bookmarks = await sql`
+          SELECT name, node_id, context, created_at, updated_at
+          FROM workflowy_bookmarks
+          WHERE account_key = ${accountKey}
+          ORDER BY name
         `;
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Bookmark "${name}" saved with node ID: ${node_id}`,
-            },
-          ],
-        };
+        const aiInstructionsBookmark = bookmarks.find(
+          (bookmark) => bookmark.name === AI_INSTRUCTIONS_BOOKMARK,
+        );
+        const userInstructions = aiInstructionsBookmark
+          ? await readUserInstructions(apiKey, String(aiInstructionsBookmark.node_id))
+          : undefined;
+
+        return jsonContent({
+          _instructions:
+            "READ THIS FIRST: Use user_instructions for this conversation when present. Use bookmark node_ids directly with read_doc.",
+          account: {
+            id: accountKey.slice(0, 12),
+            storage: "remote-neon",
+          },
+          bookmarks,
+          user_instructions: userInstructions,
+          action_required: aiInstructionsBookmark
+            ? undefined
+            : `No ${AI_INSTRUCTIONS_BOOKMARK} bookmark found. If the user has an AI Instructions node, read it and save it with save_bookmark using name "${AI_INSTRUCTIONS_BOOKMARK}".`,
+        });
       },
     );
 
     server.tool(
-      "list_bookmarks",
-      "List all saved Workflowy bookmarks. Use this to see what locations have been bookmarked.",
-      {},
-      async (_args, extra) => {
-        getApiKey(extra); // Ensure auth is present
+      "save_bookmark",
+      "Save a Workflowy node ID with a friendly name and context notes for future sessions.",
+      {
+        name: z
+          .string()
+          .min(1)
+          .describe("A friendly name, for example daily_tasks or ai_instructions"),
+        node_id: z
+          .string()
+          .min(1)
+          .describe("A Workflowy node tag, UUID, special target, or Workflowy link"),
+        context: z
+          .string()
+          .optional()
+          .describe("Notes for future AI sessions about when and how to use this node"),
+      },
+      async (
+        {
+          name,
+          node_id,
+          context,
+        }: { name: string; node_id: string; context?: string },
+        extra,
+      ) => {
+        const apiKey = getApiKey(extra);
+        const accountKey = accountKeyFromApiKey(apiKey);
         const sql = await getDb();
-        const result =
-          await sql`SELECT name, node_id, created_at FROM bookmarks ORDER BY name`;
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
+        const normalizedNodeId = normalizeNodeId(node_id);
+        const normalizedContext = context?.trim() || null;
+
+        await sql`
+          INSERT INTO workflowy_bookmarks (account_key, name, node_id, context)
+          VALUES (${accountKey}, ${name}, ${normalizedNodeId}, ${normalizedContext})
+          ON CONFLICT (account_key, name)
+          DO UPDATE SET
+            node_id = EXCLUDED.node_id,
+            context = EXCLUDED.context,
+            updated_at = NOW()
+        `;
+
+        return textContent(
+          `Bookmark "${name}" saved with node ID: ${normalizedNodeId}${
+            normalizedContext ? ` and context: "${normalizedContext}"` : ""
+          }`,
+        );
       },
     );
 
@@ -124,312 +454,168 @@ const handler = createMcpHandler(
       "delete_bookmark",
       "Delete a saved bookmark by name.",
       {
-        name: z.string().describe("The bookmark name to delete"),
+        name: z.string().min(1).describe("The bookmark name to delete"),
       },
       async ({ name }: { name: string }, extra) => {
-        getApiKey(extra); // Ensure auth is present
+        const apiKey = getApiKey(extra);
+        const accountKey = accountKeyFromApiKey(apiKey);
         const sql = await getDb();
-        const result =
-          await sql`DELETE FROM bookmarks WHERE name = ${name} RETURNING name`;
-        if (result.length === 0) {
-          return {
-            content: [{ type: "text", text: `Bookmark "${name}" not found` }],
-          };
+        const deleted = await sql`
+          DELETE FROM workflowy_bookmarks
+          WHERE account_key = ${accountKey} AND name = ${name}
+          RETURNING name
+        `;
+
+        if (deleted.length === 0) {
+          return textContent(`Bookmark "${name}" not found`);
         }
-        return {
-          content: [{ type: "text", text: `Bookmark "${name}" deleted` }],
-        };
+
+        return textContent(`Bookmark "${name}" deleted`);
       },
     );
 
-    // ==================== WORKFLOWY READ TOOLS ====================
-
     server.tool(
-      "list_nodes",
-      "List child nodes under a parent. Always use the specified parent_id if you know it. Otherwise, use parent_id='None' for top-level nodes, or use 'inbox'/'home' for those two special locations.",
+      "read_doc",
+      "Read a Workflowy node and its children using the LLM Doc API. Returns tag-as-key JSON.",
       {
-        parent_id: z
+        node_id: z
           .string()
+          .min(1)
           .describe(
-            "Parent node ID: 'None' for top-level, 'inbox', 'home', or a node UUID",
+            "12-hex tag, full UUID, Workflowy link, or special target: today, tomorrow, next_week, inbox, None",
           ),
+        depth: z
+          .number()
+          .optional()
+          .describe("How many child levels to include. Default 3, max 10."),
       },
-      async ({ parent_id }: { parent_id: string }, extra) => {
-        return workflowyRequest(
-          getApiKey(extra),
-          `/api/v1/nodes?parent_id=${encodeURIComponent(parent_id)}`,
-          "GET",
-        );
-      },
+      async (
+        { node_id, depth }: { node_id: string; depth?: number },
+        extra,
+      ) => llmDocRead(getApiKey(extra), node_id, depth),
     );
 
     server.tool(
-      "get_node",
-      "Get a single node by its ID. Returns the node's name, note, and metadata.",
+      "edit_doc",
+      "Edit Workflowy nodes using the LLM Doc API. Supports insert, update, delete, and move in one batched request.",
       {
-        node_id: z.string().describe("The node UUID to retrieve"),
+        root: z
+          .string()
+          .min(1)
+          .describe("Subtree root tag/UUID or target such as today, inbox, or None"),
+        operations: z
+          .array(operationSchema)
+          .min(1)
+          .describe("Operations to apply in order"),
       },
-      async ({ node_id }: { node_id: string }, extra) => {
-        return workflowyRequest(
-          getApiKey(extra),
-          `/api/v1/nodes/${node_id}`,
-          "GET",
-        );
-      },
-    );
-
-    server.tool(
-      "export_all_nodes",
-      "Export all nodes from the entire Workflowy account. WARNING: Rate limited to 1 request per minute. Use sparingly.",
-      {},
-      async (_args, extra) => {
-        return workflowyRequest(
-          getApiKey(extra),
-          "/api/v1/nodes-export",
-          "GET",
-        );
-      },
+      async (
+        {
+          root,
+          operations,
+        }: { root: string; operations: LlmDocOperation[] },
+        extra,
+      ) => llmDocEdit(getApiKey(extra), root, operations),
     );
 
     server.tool(
       "get_targets",
-      "Get special Workflowy targets like 'inbox' and 'home'. Useful for discovering available special locations.",
+      "Get special Workflowy targets such as inbox and home.",
       {},
       async (_args, extra) => {
-        return workflowyRequest(getApiKey(extra), "/api/v1/targets", "GET");
-      },
-    );
-
-    // ==================== WORKFLOWY WRITE TOOLS ====================
-
-    server.tool(
-      "create_node",
-      "Create a new node (bullet point) in Workflowy. The node will be added as a child of the specified parent.",
-      {
-        name: z.string().describe("The text content of the node"),
-        parent_id: z
-          .string()
-          .describe(
-            "Where to create the node: 'inbox', 'home', 'None' for top-level, or a node UUID",
-          ),
-        note: z
-          .string()
-          .optional()
-          .describe("Optional note/description for the node"),
-      },
-      async (
-        {
-          name,
-          parent_id,
-          note,
-        }: {
-          name: string;
-          parent_id: string;
-          note?: string;
-        },
-        extra,
-      ) => {
-        const body: Record<string, unknown> = { name, parent_id };
-        if (note) body.note = note;
-        return workflowyRequest(
-          getApiKey(extra),
-          "/api/v1/nodes",
-          "POST",
-          body,
-        );
-      },
-    );
-
-    server.tool(
-      "update_node",
-      "Update an existing node's name or note.",
-      {
-        node_id: z.string().describe("The node UUID to update"),
-        name: z.string().optional().describe("New name/text for the node"),
-        note: z.string().optional().describe("New note for the node"),
-      },
-      async (
-        {
-          node_id,
-          name,
-          note,
-        }: {
-          node_id: string;
-          name?: string;
-          note?: string;
-        },
-        extra,
-      ) => {
-        const body: Record<string, unknown> = {};
-        if (name !== undefined) body.name = name;
-        if (note !== undefined) body.note = note;
-        return workflowyRequest(
-          getApiKey(extra),
-          `/api/v1/nodes/${node_id}`,
-          "POST",
-          body,
-        );
-      },
-    );
-
-    server.tool(
-      "delete_node",
-      "Permanently delete a node and all its children. Use with caution.",
-      {
-        node_id: z.string().describe("The node UUID to delete"),
-      },
-      async ({ node_id }: { node_id: string }, extra) => {
-        return workflowyRequest(
-          getApiKey(extra),
-          `/api/v1/nodes/${node_id}`,
-          "DELETE",
-        );
-      },
-    );
-
-    server.tool(
-      "move_node",
-      "Move a node to a different parent location.",
-      {
-        node_id: z.string().describe("The node UUID to move"),
-        parent_id: z
-          .string()
-          .describe(
-            "New parent: 'inbox', 'home', 'None' for top-level, or a node UUID",
-          ),
-      },
-      async (
-        {
-          node_id,
-          parent_id,
-        }: {
-          node_id: string;
-          parent_id: string;
-        },
-        extra,
-      ) => {
-        return workflowyRequest(
-          getApiKey(extra),
-          `/api/v1/nodes/${node_id}/move`,
-          "POST",
-          {
-            parent_id,
-          },
-        );
-      },
-    );
-
-    // ==================== WORKFLOWY COMPLETION TOOLS ====================
-
-    server.tool(
-      "complete_node",
-      "Mark a node as completed (checked off).",
-      {
-        node_id: z.string().describe("The node UUID to mark as complete"),
-      },
-      async ({ node_id }: { node_id: string }, extra) => {
-        return workflowyRequest(
-          getApiKey(extra),
-          `/api/v1/nodes/${node_id}/complete`,
-          "POST",
-        );
-      },
-    );
-
-    server.tool(
-      "uncomplete_node",
-      "Mark a node as not completed (unchecked).",
-      {
-        node_id: z.string().describe("The node UUID to mark as incomplete"),
-      },
-      async ({ node_id }: { node_id: string }, extra) => {
-        return workflowyRequest(
-          getApiKey(extra),
-          `/api/v1/nodes/${node_id}/uncomplete`,
-          "POST",
-        );
+        try {
+          const result = await workflowyJsonRequest(
+            getApiKey(extra),
+            `${WORKFLOWY_API_BASE}/api/v1/targets`,
+            { method: "GET" },
+          );
+          return jsonContent({
+            http_status: result.status,
+            ok: result.ok,
+            data: result.data,
+          });
+        } catch (error) {
+          return jsonContent({ error: true, message: errorMessage(error) });
+        }
       },
     );
   },
-  {
-    instructions: `This MCP server connects to a user's Workflowy account. Workflowy is an outliner app where notes are organized as nested bullet points (nodes).
-
-## Key Concepts
-- Nodes have a UUID (id), name (text content), and optional note (description)
-- Nodes can be nested under other nodes (parent_id)
-- Special locations: 'inbox', 'home', or 'None' (top-level)
-
-## Bookmarks
-Bookmarks let you save node IDs with friendly names. When a user mentions a named location (like "my work inbox" or "project notes"), use list_bookmarks to see all saved bookmarks and pick the one that best matches what the user is referring to.
-
-## Common Workflows
-
-**Adding content to a bookmarked location:**
-1. list_bookmarks to see all saved locations
-2. Pick the bookmark that best matches what the user mentioned
-3. create_node with that node_id as parent_id
-
-**Exploring the hierarchy:**
-1. list_nodes with parent_id='None' to see top-level nodes
-2. list_nodes with a specific node_id to see its children
-
-## Tips
-- Always use list_bookmarks when the user refers to a named location, then pick the best match
-- Avoid export_all_nodes unless necessary (rate limited to 1/min)
-- Node names support basic formatting and markdown`,
-  },
-  {
-    basePath: "/api",
-  },
+  { instructions: serverInstructions },
+  { basePath: "/api" },
 );
 
-// Token verification function for withMcpAuth
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const aBuffer = Buffer.from(a);
+  const bBuffer = Buffer.from(b);
+  if (aBuffer.length !== bBuffer.length) {
+    return false;
+  }
+  return timingSafeEqual(aBuffer, bBuffer);
+}
+
 const verifyToken = async (
   _req: Request,
   bearerToken?: string,
 ): Promise<AuthInfo | undefined> => {
-  if (!bearerToken) return undefined;
-
-  // Token format: "ACCESS_SECRET:WORKFLOWY_API_KEY"
-  const accessSecret = process.env.ACCESS_SECRET;
-  if (!accessSecret) {
-    // Without an access secret, all users would share the same database and unauthenticated callers could
-    // access bookmarks. Treat a missing secret as a misconfiguration and reject the request outright.
+  if (!bearerToken) {
     return undefined;
   }
 
-  const separator = ":";
-  const separatorIndex = bearerToken.indexOf(separator);
+  const accessSecret = process.env.ACCESS_SECRET;
+  if (!accessSecret) {
+    return undefined;
+  }
 
+  const separatorIndex = bearerToken.indexOf(":");
   if (separatorIndex <= 0) {
-    // No secret provided or colon at first position (empty secret), reject
     return undefined;
   }
 
   const providedSecret = bearerToken.slice(0, separatorIndex);
-  if (providedSecret !== accessSecret) {
-    // Secret doesn't match, reject
+  if (!timingSafeStringEqual(providedSecret, accessSecret)) {
     return undefined;
   }
 
-  // Extract the actual Workflowy API key after the secret
-  const workflowyApiKey = bearerToken.slice(separatorIndex + 1);
-
+  const workflowyApiKey = bearerToken.slice(separatorIndex + 1).trim();
   if (!workflowyApiKey) {
-    // No API key after secret, reject
     return undefined;
   }
 
   return {
     token: workflowyApiKey,
     scopes: ["workflowy"],
-    clientId: "workflowy-user",
+    clientId: accountKeyFromApiKey(workflowyApiKey).slice(0, 12),
   };
 };
 
-// Wrap handler with auth - makes authInfo available in tool handlers via extra.authInfo
-const authHandler = withMcpAuth(handler, verifyToken, {
-  required: true,
-});
+function originIsAllowed(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  const allowedOrigins = process.env.ALLOWED_ORIGINS;
+  if (!origin || !allowedOrigins?.trim()) {
+    return true;
+  }
 
-export { authHandler as GET, authHandler as POST, authHandler as DELETE };
+  return allowedOrigins
+    .split(",")
+    .map((allowedOrigin) => allowedOrigin.trim())
+    .filter(Boolean)
+    .includes(origin);
+}
+
+const authHandler = withMcpAuth(handler, verifyToken, { required: true });
+const runAuthHandler = authHandler as (
+  request: Request,
+  context?: { params?: { transport?: string } },
+) => Response | Promise<Response>;
+
+async function route(
+  request: Request,
+  context: { params?: { transport?: string } },
+): Promise<Response> {
+  if (!originIsAllowed(request)) {
+    return new Response("Origin not allowed", { status: 403 });
+  }
+
+  return runAuthHandler(request, context);
+}
+
+export { route as DELETE, route as GET, route as POST };

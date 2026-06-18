@@ -7,9 +7,6 @@ node_modules
 # Next.js build output
 .next
 
-# Lock files (using pnpm)
-package-lock.json
-
 # Environment
 .env
 .env.local

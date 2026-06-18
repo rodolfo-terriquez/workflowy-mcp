@@ -1,7 +1,7 @@
 {
-  "name": "mcp-on-vercel",
-  "version": "1.0.0",
-  "description": "",
+  "name": "workflowy-mcp",
+  "version": "0.1.0",
+  "description": "A remote self-hosted MCP server for Workflowy.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -9,8 +9,9 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
     "@neondatabase/serverless": "^0.10.0",
     "mcp-handler": "^1.0.4",
     "next": "^14.2.0",
