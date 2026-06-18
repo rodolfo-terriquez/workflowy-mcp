@@ -1129,6 +1129,31 @@ function originIsAllowed(request: Request): boolean {
     .includes(origin);
 }
 
+function corsHeaders(request: Request): HeadersInit {
+  const origin = request.headers.get("origin");
+  const allowedOrigins = process.env.ALLOWED_ORIGINS;
+  const allowOrigin = allowedOrigins?.trim() ? origin ?? "null" : origin ?? "*";
+
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers":
+      "authorization, content-type, accept, mcp-session-id, mcp-protocol-version, last-event-id",
+    "Access-Control-Expose-Headers":
+      "mcp-session-id, mcp-protocol-version, www-authenticate",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
+}
+
+function withCors(response: Response, request: Request): Response {
+  const headers = corsHeaders(request);
+  for (const [key, value] of Object.entries(headers)) {
+    response.headers.set(key, value);
+  }
+  return response;
+}
+
 const authHandler = withMcpAuth(handler, verifyToken, { required: true });
 const runAuthHandler = authHandler as (
   request: Request,
@@ -1143,7 +1168,20 @@ async function route(
     return new Response("Origin not allowed", { status: 403 });
   }
 
-  return runAuthHandler(request, context);
+  return withCors(await runAuthHandler(request, context), request);
 }
 
-export { route as DELETE, route as GET, route as POST };
+async function options(
+  request: Request,
+): Promise<Response> {
+  if (!originIsAllowed(request)) {
+    return new Response("Origin not allowed", { status: 403 });
+  }
+
+  return new Response(null, {
+    status: 204,
+    headers: corsHeaders(request),
+  });
+}
+
+export { route as DELETE, route as GET, options as OPTIONS, route as POST };
