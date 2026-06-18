@@ -26,7 +26,6 @@
   width: 100%;
   height: 100%;
   z-index: 0;
-  opacity: 0.7;
   pointer-events: none;
 }
 
@@ -54,7 +53,7 @@
   padding: 34px;
   background: rgba(31, 31, 52, 0.96);
   border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
+  border-radius: 16px;
   box-shadow: 0 24px 70px rgba(0, 0, 0, 0.24);
   text-align: center;
   backdrop-filter: blur(8px);
@@ -63,15 +62,7 @@
 .dashboardHeader {
   display: grid;
   justify-items: center;
-  gap: 14px;
-  margin-bottom: 24px;
-}
-
-.dashboardLogo {
-  width: 56px;
-  height: 56px;
-  border-radius: 10px;
-  object-fit: cover;
+  margin-bottom: 18px;
 }
 
 .dashboardHeader h1 {
@@ -87,11 +78,7 @@
   align-items: center;
   justify-content: center;
   gap: 9px;
-  margin-bottom: 28px;
-  padding: 9px 14px;
-  background: rgba(0, 0, 0, 0.24);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 999px;
+  margin-bottom: 30px;
 }
 
 .dashboardStatusDot {
@@ -200,10 +187,13 @@
 }
 
 .dashboardGithubLink {
-  margin-top: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 24px;
   color: #666;
-  font-size: 13px;
   text-decoration: none;
+  transition: color 0.2s ease;
 }
 
 .dashboardGithubLink:hover {
@@ -241,13 +231,6 @@
 
 .sidebarBackButton:hover {
   color: var(--text);
-}
-
-.logo {
-  width: 38px;
-  height: 38px;
-  border-radius: 8px;
-  object-fit: cover;
 }
 
 .sidebarHeader h1 {
@@ -335,7 +318,7 @@
 }
 
 .header {
-  margin-bottom: 28px;
+  margin-bottom: 26px;
 }
 
 .header h1 {
@@ -353,14 +336,6 @@
   line-height: 1.55;
 }
 
-.panel {
-  margin-bottom: 20px;
-  padding: 18px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
-
 .sectionHeaderRow {
   display: flex;
   align-items: center;
@@ -372,9 +347,13 @@
 .sectionHeaderRow h2 {
   margin: 0;
   color: #fff;
-  font-size: 15px;
+  font-size: 16px;
   font-weight: 650;
   letter-spacing: 0;
+}
+
+.toolSection {
+  margin-bottom: 28px;
 }
 
 .inlineActions {
@@ -407,8 +386,16 @@
   padding: 0 12px;
   background: transparent;
   color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
   text-align: left;
   cursor: pointer;
+}
+
+.toolEditorHeader > span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .toolEditorHeader:hover {
@@ -436,6 +423,7 @@
 
 .toolEditorBody textarea {
   width: 100%;
+  min-height: 180px;
   min-width: 0;
   resize: vertical;
   padding: 10px 12px;
@@ -466,6 +454,7 @@
 .inputGroup span {
   color: var(--muted);
   font-size: 12px;
+  font-weight: 600;
 }
 
 .inputGroup input,
@@ -477,6 +466,7 @@
   background: rgba(8, 8, 18, 0.74);
   border: 1px solid var(--border);
   border-radius: 8px;
+  font-size: 13px;
   outline: none;
 }
 
@@ -491,6 +481,10 @@
   padding: 10px 12px;
 }
 
+.serverInstructionsField {
+  min-height: 260px;
+}
+
 .inputGroup input:focus,
 .inputGroup textarea:focus,
 .searchRow input:focus {
@@ -502,7 +496,7 @@
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  margin: 14px 0 20px;
+  margin: 12px 0 24px;
 }
 
 .primaryButton,
@@ -512,11 +506,14 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 36px;
-  padding: 0 13px;
+  min-height: 40px;
+  padding: 0 14px;
   border-radius: 6px;
   color: #fff;
   cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
 }
 
 .primaryButton {
@@ -544,8 +541,8 @@
 }
 
 .dangerButtonSmall {
-  min-height: 30px;
-  padding: 0 10px;
+  min-height: 32px;
+  padding: 0 11px;
   font-size: 12px;
 }
 
@@ -575,7 +572,10 @@
 
 .metric span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
 }
 
 .metric strong {
@@ -590,19 +590,21 @@
   display: inline-flex;
   gap: 4px;
   padding: 4px;
-  margin-bottom: 16px;
+  margin-bottom: 12px;
   background: rgba(0, 0, 0, 0.24);
   border: 1px solid var(--border);
   border-radius: 8px;
 }
 
 .tab {
-  height: 34px;
+  height: 36px;
   padding: 0 12px;
   background: transparent;
   color: var(--muted);
   border-radius: 6px;
   cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .tabActive {
@@ -620,6 +622,7 @@
   border: 1px solid var(--border);
   border-radius: 8px;
   color: #d8d8ff;
+  font-size: 13px;
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -641,7 +644,7 @@
 .itemCard h2 {
   margin: 0 0 8px;
   color: #fff;
-  font-size: 15px;
+  font-size: 16px;
   letter-spacing: 0;
 }
 
@@ -680,6 +683,7 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
+  margin-bottom: 20px;
 }
 
 .logContainer {

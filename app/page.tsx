@@ -157,69 +157,278 @@ function initParticleBackground(canvas: HTMLCanvasElement): () => void {
   }
   const context = ctx;
 
-  let frame = 0;
-  let width = 0;
-  let height = 0;
-  const spacing = 14;
-  const radius = 2.4;
-  const dots: Array<{ x: number; y: number; phase: number; speed: number }> = [];
+  let animFrameId = 0;
+  let spawnInterval = 0;
+  let resizeTimeout = 0;
 
-  function resize() {
-    const ratio = window.devicePixelRatio || 1;
-    width = window.innerWidth;
-    height = window.innerHeight;
-    canvas.width = Math.floor(width * ratio);
-    canvas.height = Math.floor(height * ratio);
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
-    context.setTransform(ratio, 0, 0, ratio, 0, 0);
-    dots.length = 0;
+  const bgR = 26;
+  const bgG = 26;
+  const bgB = 46;
+  const spacing = 10;
+  const radius = 3;
+  const baseRgb = { r: 38, g: 38, b: 58 };
+  const targetRgb = { r: 140, g: 140, b: 170 };
+  const fadeRgb = { r: bgR, g: bgG, b: bgB };
+  const transitionSpeed = 2.5;
+  const targetActivePercent = 0.006;
+  const moveChance = 0.7;
+  const minWaitTime = 600;
+  const maxWaitTime = 2200;
+  const checkInterval = 120;
+  const edgeFadeDistance = 300;
 
-    for (let x = spacing / 2; x < width; x += spacing) {
-      for (let y = spacing / 2; y < height; y += spacing) {
-        const edgeFade = Math.min(y, height - y, 260) / 260;
-        dots.push({
+  const STATE_IDLE = 0;
+  const STATE_DARKENING = 1;
+  const STATE_WAITING = 2;
+  const STATE_LIGHTENING_TO_MOVE = 3;
+  const STATE_DARKENING_AFTER_MOVE = 4;
+  const STATE_DECAYING = 5;
+
+  const directions = [
+    { dx: -1, dy: 0 },
+    { dx: 1, dy: 0 },
+    { dx: 0, dy: -1 },
+    { dx: 0, dy: 1 },
+    { dx: -1, dy: -1 },
+    { dx: 1, dy: -1 },
+    { dx: -1, dy: 1 },
+    { dx: 1, dy: 1 },
+  ];
+
+  interface Dot {
+    x: number;
+    y: number;
+    gridX: number;
+    gridY: number;
+    progress: number;
+    state: number;
+    waitUntil: number;
+    fadedBaseR: number;
+    fadedBaseG: number;
+    fadedBaseB: number;
+    fadedTargetR: number;
+    fadedTargetG: number;
+    fadedTargetB: number;
+    drawX?: number;
+    drawY?: number;
+  }
+
+  let dots: Dot[] = [];
+  const dotGrid: Record<string, Dot> = {};
+  const activeDots = new Set<Dot>();
+  let gridCols = 0;
+  let gridRows = 0;
+
+  function lerp(a: number, b: number, t: number): number {
+    return a + (b - a) * t;
+  }
+
+  function calcEdgeFade(y: number): number {
+    const dist = Math.min(y, canvas.height - y);
+    return dist >= edgeFadeDistance ? 1 : dist / edgeFadeDistance;
+  }
+
+  function initDots(): void {
+    dots = [];
+    activeDots.clear();
+    for (const key in dotGrid) {
+      delete dotGrid[key];
+    }
+    gridCols = Math.floor(canvas.width / spacing);
+    gridRows = Math.floor(canvas.height / spacing);
+
+    for (let gx = 0; gx < gridCols; gx += 1) {
+      for (let gy = 0; gy < gridRows; gy += 1) {
+        const x = gx * spacing + spacing / 2;
+        const y = gy * spacing + spacing / 2;
+        const edgeFade = calcEdgeFade(y);
+        const dot: Dot = {
           x,
           y,
-          phase: Math.random() * Math.PI * 2,
-          speed: 0.004 + Math.random() * 0.006,
-        });
-        if (edgeFade < 0.08) {
-          dots[dots.length - 1].phase += 4;
-        }
+          gridX: gx,
+          gridY: gy,
+          progress: 0,
+          state: STATE_IDLE,
+          waitUntil: 0,
+          fadedBaseR: Math.round(lerp(fadeRgb.r, baseRgb.r, edgeFade)),
+          fadedBaseG: Math.round(lerp(fadeRgb.g, baseRgb.g, edgeFade)),
+          fadedBaseB: Math.round(lerp(fadeRgb.b, baseRgb.b, edgeFade)),
+          fadedTargetR: Math.round(lerp(fadeRgb.r, targetRgb.r, edgeFade)),
+          fadedTargetG: Math.round(lerp(fadeRgb.g, targetRgb.g, edgeFade)),
+          fadedTargetB: Math.round(lerp(fadeRgb.b, targetRgb.b, edgeFade)),
+        };
+        dots.push(dot);
+        dotGrid[`${gx},${gy}`] = dot;
       }
     }
   }
 
-  function draw(time: number) {
-    context.fillStyle = "#171728";
-    context.fillRect(0, 0, width, height);
-
-    for (const dot of dots) {
-      const edgeFade = Math.min(dot.y, height - dot.y, 300) / 300;
-      const pulse = (Math.sin(time * dot.speed + dot.phase) + 1) / 2;
-      const alpha = 0.05 + pulse * 0.13 * edgeFade;
-      context.fillStyle = `rgba(165, 168, 252, ${alpha})`;
-      context.beginPath();
-      context.arc(dot.x, dot.y, radius, 0, Math.PI * 2);
-      context.fill();
-    }
-
-    frame = window.requestAnimationFrame(draw);
+  function getDotAt(gx: number, gy: number): Dot | null {
+    return dotGrid[`${gx},${gy}`] || null;
   }
 
-  resize();
-  window.addEventListener("resize", resize);
-  frame = window.requestAnimationFrame(draw);
+  function isAvailable(gx: number, gy: number): boolean {
+    if (gx < 0 || gx >= gridCols || gy < 0 || gy >= gridRows) {
+      return false;
+    }
+    const dot = getDotAt(gx, gy);
+    return Boolean(dot && dot.state === STATE_IDLE);
+  }
+
+  function getAdjacentAvailable(dot: Dot): Array<{ gx: number; gy: number }> {
+    return directions
+      .filter((direction) => isAvailable(dot.gridX + direction.dx, dot.gridY + direction.dy))
+      .map((direction) => ({ gx: dot.gridX + direction.dx, gy: dot.gridY + direction.dy }));
+  }
+
+  function activateDot(dot: Dot): void {
+    dot.state = STATE_DARKENING;
+    activeDots.add(dot);
+  }
+
+  function deactivateDot(dot: Dot): void {
+    dot.state = STATE_IDLE;
+    dot.progress = 0;
+    activeDots.delete(dot);
+  }
+
+  function spawnWanderers(): void {
+    const needed = Math.floor(dots.length * targetActivePercent) - activeDots.size;
+    if (needed <= 0) {
+      return;
+    }
+
+    const idle = dots.filter((dot) => dot.state === STATE_IDLE);
+    for (let index = 0; index < needed && idle.length > 0; index += 1) {
+      const idleIndex = Math.floor(Math.random() * idle.length);
+      activateDot(idle[idleIndex]);
+      idle.splice(idleIndex, 1);
+    }
+  }
+
+  function draw(): void {
+    context.fillStyle = `rgb(${bgR}, ${bgG}, ${bgB})`;
+    context.fillRect(0, 0, canvas.width, canvas.height);
+
+    const groups = new Map<string, Dot[]>();
+    for (const dot of dots) {
+      const r = Math.round(lerp(dot.fadedBaseR, dot.fadedTargetR, dot.progress));
+      const g = Math.round(lerp(dot.fadedBaseG, dot.fadedTargetG, dot.progress));
+      const b = Math.round(lerp(dot.fadedBaseB, dot.fadedTargetB, dot.progress));
+      const key = `${r},${g},${b}`;
+      if (!groups.has(key)) {
+        groups.set(key, []);
+      }
+      groups.get(key)?.push(dot);
+    }
+
+    for (const [key, groupDots] of groups) {
+      context.fillStyle = `rgb(${key})`;
+      context.beginPath();
+      for (const dot of groupDots) {
+        const px = dot.drawX ?? dot.x;
+        const py = dot.drawY ?? dot.y;
+        context.moveTo(px + radius, py);
+        context.arc(px, py, radius, 0, Math.PI * 2);
+      }
+      context.fill();
+    }
+  }
+
+  function update(): void {
+    const speed = transitionSpeed / 100;
+    const now = performance.now();
+    const remove: Dot[] = [];
+
+    for (const dot of activeDots) {
+      switch (dot.state) {
+        case STATE_DARKENING:
+          dot.progress += speed;
+          if (dot.progress >= 1) {
+            dot.progress = 1;
+            dot.state = STATE_WAITING;
+            dot.waitUntil = now + minWaitTime + Math.random() * (maxWaitTime - minWaitTime);
+          }
+          break;
+        case STATE_WAITING:
+          if (now >= dot.waitUntil) {
+            if (Math.random() < moveChance) {
+              const available = getAdjacentAvailable(dot);
+              if (available.length > 0) {
+                const position = available[Math.floor(Math.random() * available.length)];
+                const targetDot = getDotAt(position.gx, position.gy);
+                if (targetDot) {
+                  targetDot.state = STATE_DARKENING_AFTER_MOVE;
+                  activeDots.add(targetDot);
+                  dot.state = STATE_LIGHTENING_TO_MOVE;
+                }
+              } else {
+                dot.state = STATE_DECAYING;
+              }
+            } else {
+              dot.state = STATE_DECAYING;
+            }
+          }
+          break;
+        case STATE_LIGHTENING_TO_MOVE:
+        case STATE_DECAYING:
+          dot.progress -= speed;
+          if (dot.progress <= 0) {
+            remove.push(dot);
+          }
+          break;
+        case STATE_DARKENING_AFTER_MOVE:
+          dot.progress += speed;
+          if (dot.progress >= 1) {
+            dot.progress = 1;
+            dot.state = STATE_WAITING;
+            dot.waitUntil = now + minWaitTime + Math.random() * (maxWaitTime - minWaitTime);
+          }
+          break;
+      }
+    }
+
+    for (const dot of remove) {
+      deactivateDot(dot);
+    }
+  }
+
+  function resizeCanvas(): void {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+
+  function onResize(): void {
+    window.clearTimeout(resizeTimeout);
+    resizeTimeout = window.setTimeout(() => {
+      resizeCanvas();
+      initDots();
+    }, 200);
+  }
+
+  function animate(): void {
+    update();
+    draw();
+    animFrameId = window.requestAnimationFrame(animate);
+  }
+
+  resizeCanvas();
+  initDots();
+  spawnInterval = window.setInterval(spawnWanderers, checkInterval);
+  window.addEventListener("resize", onResize);
+  animate();
 
   return () => {
-    window.cancelAnimationFrame(frame);
-    window.removeEventListener("resize", resize);
+    window.cancelAnimationFrame(animFrameId);
+    window.clearInterval(spawnInterval);
+    window.clearTimeout(resizeTimeout);
+    window.removeEventListener("resize", onResize);
   };
 }
 
 export default function Home() {
   const particleCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const autoConnectionCheckRef = useRef<string | null>(null);
   const [appMode, setAppMode] = useState<"dashboard" | "settings">("dashboard");
   const [adminStatus, setAdminStatus] = useState<AdminStatus | null>(null);
   const [adminSecret, setAdminSecret] = useState("");
@@ -272,6 +481,38 @@ export default function Home() {
       : !adminStatus.admin_configured || (isAuthenticated && !serverReady)
         ? "failed"
         : connectionStatus;
+
+  useEffect(() => {
+    if (!canCallMcp || connectionStatus !== "idle" || isBusy || isAuthBusy) {
+      return;
+    }
+
+    const autoCheckKey = [
+      endpoint,
+      adminStatus?.authenticated,
+      adminStatus?.mcp_access_secret_configured,
+      adminStatus?.workflowy_api_key_configured,
+      adminStatus?.database_configured,
+    ].join(":");
+
+    if (autoConnectionCheckRef.current === autoCheckKey) {
+      return;
+    }
+
+    autoConnectionCheckRef.current = autoCheckKey;
+    void testConnection();
+  }, [
+    adminStatus?.authenticated,
+    adminStatus?.database_configured,
+    adminStatus?.mcp_access_secret_configured,
+    adminStatus?.workflowy_api_key_configured,
+    canCallMcp,
+    connectionStatus,
+    endpoint,
+    isAuthBusy,
+    isBusy,
+  ]);
+
   const settingsToolNames = mcpSettings?.tool_names ?? MCP_TOOL_NAMES;
   const defaultToolDescriptions =
     mcpSettings?.default_tool_descriptions ?? DEFAULT_TOOL_DESCRIPTIONS;
@@ -793,12 +1034,40 @@ export default function Home() {
       return "Admin console locked";
     }
     if (!serverReady) {
-      return "Server configuration incomplete";
+      return "Configuration issues";
     }
-    return connectionStatus === "connected"
-      ? "Remote MCP connected"
-      : "Ready to test connection";
+    if (connectionStatus === "connected") {
+      return "Connected";
+    }
+    if (connectionStatus === "checking") {
+      return "Checking connection";
+    }
+    if (connectionStatus === "failed") {
+      return "Connection failed";
+    }
+    return "Not connected";
   })();
+  const diagnosticLogs = [
+    ...serverLogs.map((entry) => ({
+      id: `server-${entry.id}`,
+      type: entry.level,
+      timestamp: entry.created_at,
+      source: "server",
+      message: `${entry.event}: ${entry.message}`,
+      metadata: formatLogMetadata(entry.metadata),
+    })),
+    ...activity.map((entry) => ({
+      id: `browser-${entry.id}`,
+      type: entry.type,
+      timestamp: entry.timestamp,
+      source: "browser",
+      message: entry.message,
+      metadata: "",
+    })),
+  ].sort(
+    (first, second) =>
+      new Date(first.timestamp).getTime() - new Date(second.timestamp).getTime(),
+  );
 
   return (
     <>
@@ -808,7 +1077,6 @@ export default function Home() {
         <main className={styles.dashboardWrapper}>
           <section className={styles.dashboardCard}>
             <div className={styles.dashboardHeader}>
-              <img src="/wf-mcp.png" alt="" className={styles.dashboardLogo} />
               <h1>Workflowy MCP</h1>
             </div>
 
@@ -849,7 +1117,6 @@ export default function Home() {
         <main className={styles.dashboardWrapper}>
           <section className={styles.dashboardCard}>
             <div className={styles.dashboardHeader}>
-              <img src="/wf-mcp.png" alt="" className={styles.dashboardLogo} />
               <h1>Workflowy MCP</h1>
             </div>
 
@@ -897,9 +1164,13 @@ export default function Home() {
             className={styles.dashboardGithubLink}
             href="https://github.com/rodolfo-terriquez/workflowy-mcp"
             target="_blank"
-            rel="noreferrer"
+            rel="noopener noreferrer"
+            title="View on GitHub"
+            aria-label="View on GitHub"
           >
-            GitHub
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
+            </svg>
           </a>
         </main>
       )}
@@ -915,7 +1186,6 @@ export default function Home() {
           >
             ← Back to Dashboard
           </button>
-          <img src="/wf-mcp.png" alt="" className={styles.logo} />
           <div>
             <h1>Workflowy MCP</h1>
             <p>Remote console</p>
@@ -937,7 +1207,7 @@ export default function Home() {
 
         <div className={styles.sidebarFooter}>
           <span className={`${styles.statusDot} ${styles[statusTone]}`} />
-          <span>{connectionStatus === "connected" ? "Connected" : "Admin unlocked"}</span>
+          <span>{connectionText}</span>
         </div>
       </aside>
 
@@ -946,28 +1216,26 @@ export default function Home() {
           {activeSection === "connection" && (
             <>
               <Header title="Connection" subtitle="Verify the server-side credentials and deployed MCP endpoint." />
-              <div className={styles.panel}>
-                <div className={styles.gridTwo}>
-                  <label className={styles.inputGroup}>
-                    <span>Endpoint</span>
-                    <input value={endpoint} readOnly />
-                  </label>
-                  <label className={styles.inputGroup}>
-                    <span>Status</span>
-                    <input value={connectionStatus} readOnly />
-                  </label>
-                </div>
-                <div className={styles.buttonRow}>
-                  <button className={styles.primaryButton} onClick={testConnection} disabled={isBusy || !canCallMcp} type="button">
-                    Test Connection
-                  </button>
-                  <button className={styles.secondaryButton} onClick={() => refreshAdminSession()} disabled={isBusy} type="button">
-                    Refresh Status
-                  </button>
-                  <button className={styles.dangerButton} onClick={logoutAdmin} type="button">
-                    Lock Console
-                  </button>
-                </div>
+              <div className={styles.gridTwo}>
+                <label className={styles.inputGroup}>
+                  <span>Endpoint</span>
+                  <input value={endpoint} readOnly />
+                </label>
+                <label className={styles.inputGroup}>
+                  <span>Status</span>
+                  <input value={connectionStatus} readOnly />
+                </label>
+              </div>
+              <div className={styles.buttonRow}>
+                <button className={styles.primaryButton} onClick={testConnection} disabled={isBusy || !canCallMcp} type="button">
+                  Test Connection
+                </button>
+                <button className={styles.secondaryButton} onClick={() => refreshAdminSession()} disabled={isBusy} type="button">
+                  Refresh Status
+                </button>
+                <button className={styles.dangerButton} onClick={logoutAdmin} type="button">
+                  Lock Console
+                </button>
               </div>
 
               <div className={styles.summaryGrid}>
@@ -993,30 +1261,26 @@ export default function Home() {
                   JSON
                 </button>
               </div>
-              <div className={styles.panel}>
-                <div className={styles.buttonRow}>
-                  <button className={styles.secondaryButton} onClick={() => copyText(activeConfig, "Configuration")} type="button">
-                    Copy
-                  </button>
-                  <button className={styles.secondaryButton} onClick={() => copyText(endpoint, "Endpoint")} type="button">
-                    Copy Endpoint
-                  </button>
-                </div>
-                <pre className={styles.codeBlock}>{activeConfig}</pre>
+              <div className={styles.buttonRow}>
+                <button className={styles.secondaryButton} onClick={() => copyText(activeConfig, "Configuration")} type="button">
+                  Copy
+                </button>
               </div>
+              <pre className={styles.codeBlock}>{activeConfig}</pre>
             </>
           )}
 
           {activeSection === "tools" && (
             <>
               <Header title="Tools" subtitle="Customize how AI clients understand and use the hosted Workflowy tools." />
-              <div className={styles.panel}>
+              <div className={styles.toolSection}>
                 <label className={styles.inputGroup}>
                   <span>Server Instructions</span>
                   <textarea
+                    className={styles.serverInstructionsField}
                     value={serverInstructionsDraft}
                     onChange={(event) => setServerInstructionsDraft(event.target.value)}
-                    rows={12}
+                    rows={16}
                     placeholder={mcpSettings?.default_server_instructions ?? "Load settings to edit instructions."}
                   />
                 </label>
@@ -1033,7 +1297,7 @@ export default function Home() {
                 </div>
               </div>
 
-              <div className={styles.panel}>
+              <div className={styles.toolSection}>
                 <div className={styles.sectionHeaderRow}>
                   <h2>Tool Descriptions</h2>
                   <button className={styles.secondaryButton} onClick={saveMcpSettings} disabled={isBusy || !mcpSettings || !hasSettingsChanges} type="button">
@@ -1053,7 +1317,7 @@ export default function Home() {
                           <textarea
                             value={toolDescriptionDrafts[name] ?? defaultToolDescriptions[name]}
                             onChange={(event) => updateToolDescription(name, event.target.value)}
-                            rows={4}
+                            rows={8}
                           />
                           <button className={styles.secondaryButton} onClick={() => resetToolDescription(name)} disabled={!isToolCustomized(name)} type="button">
                             Reset
@@ -1064,54 +1328,33 @@ export default function Home() {
                   ))}
                 </div>
               </div>
-
-              <Header title="Active Tools" subtitle="The tool metadata returned by the deployed MCP endpoint." />
-              <div className={styles.buttonRow}>
-                <button className={styles.secondaryButton} onClick={testConnection} disabled={isBusy || !canCallMcp} type="button">
-                  Reload Tools
-                </button>
-              </div>
-              <div className={styles.list}>
-                {tools.length === 0 ? (
-                  <EmptyState text="Connect first to load tools." />
-                ) : (
-                  tools.map((tool) => (
-                    <article key={tool.name} className={styles.itemCard}>
-                      <h2>{tool.name}</h2>
-                      <p>{tool.description || "No description returned."}</p>
-                    </article>
-                  ))
-                )}
-              </div>
             </>
           )}
 
           {activeSection === "bookmarks" && (
             <>
               <Header title="Bookmarks" subtitle="Manage remote bookmarks stored in Neon for this Workflowy key." />
-              <div className={styles.panel}>
-                <div className={styles.gridTwo}>
-                  <label className={styles.inputGroup}>
-                    <span>Name</span>
-                    <input value={bookmarkName} onChange={(event) => setBookmarkName(event.target.value)} placeholder="ai_instructions" />
-                  </label>
-                  <label className={styles.inputGroup}>
-                    <span>Node ID</span>
-                    <input value={bookmarkNodeId} onChange={(event) => setBookmarkNodeId(event.target.value)} placeholder="inbox, today, or a node id" />
-                  </label>
-                </div>
+              <div className={styles.gridTwo}>
                 <label className={styles.inputGroup}>
-                  <span>Context</span>
-                  <textarea value={bookmarkContext} onChange={(event) => setBookmarkContext(event.target.value)} rows={3} />
+                  <span>Name</span>
+                  <input value={bookmarkName} onChange={(event) => setBookmarkName(event.target.value)} placeholder="ai_instructions" />
                 </label>
-                <div className={styles.buttonRow}>
-                  <button className={styles.primaryButton} onClick={saveBookmark} disabled={isBusy || !bookmarkName || !bookmarkNodeId || !canCallMcp} type="button">
-                    Save Bookmark
-                  </button>
-                  <button className={styles.secondaryButton} onClick={() => refreshBookmarks()} disabled={isBusy || !canCallMcp} type="button">
-                    Refresh
-                  </button>
-                </div>
+                <label className={styles.inputGroup}>
+                  <span>Node ID</span>
+                  <input value={bookmarkNodeId} onChange={(event) => setBookmarkNodeId(event.target.value)} placeholder="inbox, today, or a node id" />
+                </label>
+              </div>
+              <label className={styles.inputGroup}>
+                <span>Context</span>
+                <textarea value={bookmarkContext} onChange={(event) => setBookmarkContext(event.target.value)} rows={3} />
+              </label>
+              <div className={styles.buttonRow}>
+                <button className={styles.primaryButton} onClick={saveBookmark} disabled={isBusy || !bookmarkName || !bookmarkNodeId || !canCallMcp} type="button">
+                  Save Bookmark
+                </button>
+                <button className={styles.secondaryButton} onClick={() => refreshBookmarks()} disabled={isBusy || !canCallMcp} type="button">
+                  Refresh
+                </button>
               </div>
               <div className={styles.list}>
                 {bookmarks.length === 0 ? (
@@ -1151,13 +1394,11 @@ export default function Home() {
                   Refresh Status
                 </button>
               </div>
-              <div className={styles.panel}>
-                <div className={styles.searchRow}>
-                  <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search Workflowy cache" />
-                  <button className={styles.secondaryButton} onClick={searchNodes} disabled={isBusy || !searchQuery || !canCallMcp} type="button">
-                    Search
-                  </button>
-                </div>
+              <div className={styles.searchRow}>
+                <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search Workflowy cache" />
+                <button className={styles.secondaryButton} onClick={searchNodes} disabled={isBusy || !searchQuery || !canCallMcp} type="button">
+                  Search
+                </button>
               </div>
               <div className={styles.list}>
                 {searchResults?.length ? (
@@ -1180,58 +1421,38 @@ export default function Home() {
 
           {activeSection === "diagnostics" && (
             <>
-              <Header title="Diagnostics" subtitle="Server-side MCP logs and recent browser-side checks." />
+              <Header title="Diagnostics" subtitle="Server events and recent console activity in one timeline." />
               <div className={styles.sectionHeaderRow}>
-                <h2>Server Logs</h2>
+                <h2>Logs</h2>
                 <div className={styles.inlineActions}>
-                  <button className={styles.secondaryButton} onClick={() => refreshServerLogs()} disabled={isBusy || !isAuthenticated} type="button">
+                  <button className={styles.secondaryButton} onClick={() => {
+                    void refreshAdminSession();
+                    void refreshCacheStatus(false);
+                    void refreshServerLogs(false);
+                  }} disabled={isBusy} type="button">
                     Refresh
                   </button>
-                  <button className={styles.dangerButtonSmall} onClick={clearServerLogs} disabled={isBusy || !serverLogs.length} type="button">
+                  <button className={styles.dangerButton} onClick={clearServerLogs} disabled={isBusy || !serverLogs.length} type="button">
                     Clear Server Logs
+                  </button>
+                  <button className={styles.secondaryButton} onClick={() => setActivity([])} type="button">
+                    Clear Activity
                   </button>
                 </div>
               </div>
               <div className={styles.logContainer}>
-                {serverLogs.length === 0 ? (
-                  <div className={styles.logEntry}>No server logs yet.</div>
+                {diagnosticLogs.length === 0 ? (
+                  <div className={styles.logEntry}>No logs yet.</div>
                 ) : (
-                  serverLogs.map((entry) => (
-                    <div key={entry.id} className={`${styles.logEntry} ${styles[entry.level]}`}>
-                      [{formatTime(entry.created_at)}] {entry.event}: {entry.message}
-                      {formatLogMetadata(entry.metadata) && (
-                        <code>{formatLogMetadata(entry.metadata)}</code>
+                  diagnosticLogs.map((entry) => (
+                    <div key={entry.id} className={`${styles.logEntry} ${styles[entry.type]}`}>
+                      [{formatTime(entry.timestamp)}] {entry.source}: {entry.message}
+                      {entry.metadata && (
+                        <code>{entry.metadata}</code>
                       )}
                     </div>
                   ))
                 )}
-              </div>
-
-              <div className={styles.sectionHeaderRow}>
-                <h2>Browser Activity</h2>
-                <button className={styles.secondaryButton} onClick={() => setActivity([])} type="button">
-                  Clear Activity
-                </button>
-              </div>
-              <div className={styles.logContainer}>
-                {activity.length === 0 ? (
-                  <div className={styles.logEntry}>No browser activity yet.</div>
-                ) : (
-                  activity.map((entry) => (
-                    <div key={entry.id} className={`${styles.logEntry} ${styles[entry.type]}`}>
-                      [{formatTime(entry.timestamp)}] {entry.message}
-                    </div>
-                  ))
-                )}
-              </div>
-              <div className={styles.buttonRow}>
-                <button className={styles.secondaryButton} onClick={() => {
-                  void refreshAdminSession();
-                  void refreshCacheStatus(false);
-                  void refreshServerLogs(false);
-                }} disabled={isBusy} type="button">
-                  Refresh Diagnostics
-                </button>
               </div>
             </>
           )}
