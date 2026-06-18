@@ -6,9 +6,9 @@ This is the cloud sibling of [workflowy-local-mcp](https://github.com/rodolfo-te
 
 ## Status
 
-This repo is being rebuilt around the newer Workflowy LLM Doc API used by `workflowy-local-mcp`.
+This repo uses the newer Workflowy LLM Doc API from `workflowy-local-mcp`, adapted for a remote self-hosted deployment.
 
-The root web page is an owner-only setup console for testing the MCP connection, managing bookmarks, syncing/searching the cache, and copying client configuration.
+The root web page is an owner-only console for testing the MCP connection, customizing AI instructions/tool descriptions, managing bookmarks, syncing/searching the cache, viewing server logs, and copying client configuration.
 
 Current remote tools:
 
@@ -19,15 +19,15 @@ Current remote tools:
 | `delete_bookmark` | Delete a saved bookmark by name |
 | `read_doc` | Read a node and its children through Workflowy's LLM Doc API |
 | `edit_doc` | Batch insert, update, delete, or move nodes through Workflowy's LLM Doc API |
-| `search_nodes` | Search the Neon-backed Workflowy cache |
+| `search_nodes` | Search the Neon-backed Workflowy cache, with safe auto-sync when empty or stale |
 | `sync_nodes` | Refresh the Neon-backed cache from Workflowy's full export |
 | `cache_status` | Show cache freshness and node count without running a search |
 | `get_targets` | Fetch special Workflowy targets such as inbox and home |
 
 Planned next:
 
-- Incremental cache refresh after `edit_doc`
 - More formal OAuth-style auth for shared/multi-user deployments
+- Optional multi-account support for one hosted deployment
 - Cloudflare deployment option
 
 ## Security Model
@@ -47,7 +47,7 @@ Authorization: Bearer MCP_ACCESS_SECRET
 
 The root web console is protected separately with `ADMIN_SECRET`. Entering the admin secret sets a short-lived, signed, HTTP-only cookie so only the deployment owner can access the interface.
 
-The Workflowy API key is not stored in Neon or browser local storage. Bookmarks are stored in Neon under a SHA-256 hash of the API key.
+The Workflowy API key is not stored in Neon or browser local storage. Bookmarks, cache rows, custom MCP settings, and server-side MCP logs are stored in Neon under a SHA-256 hash of the API key.
 
 Remote mode changes the trust model. Your Workflowy API key is stored in your deployed server environment. If you want the key to never leave your machine, use `workflowy-local-mcp` instead.
 
@@ -170,6 +170,7 @@ http://localhost:3000/api/mcp
 
 - Vercel Fluid compute is recommended for long-lived MCP requests.
 - The Workflowy `nodes-export` endpoint is rate limited to 1 request per minute. Cache/search work should respect that limit.
-- `sync_nodes` replaces the remote cache for the configured Workflowy API key. Search results include cache freshness metadata.
-- Backup tools are intentionally not included in the remote server yet. This project is focused on remote read/write/search and first-run setup.
+- `sync_nodes` replaces the remote cache for the configured Workflowy API key. `search_nodes` will attempt a safe auto-sync when the cache is empty or stale and the export rate limit allows it.
+- Successful `edit_doc` calls trigger a targeted cache refresh for affected nodes/parent lists and mark the full cache stale for later reconciliation.
+- Backup tools are intentionally not included in the remote server. This project is focused on remote read/write/search and owner-managed setup.
 - The legacy `Authorization: Bearer ACCESS_SECRET:WORKFLOWY_API_KEY` format still works for older clients when `ACCESS_SECRET` is configured, but new deployments should use `MCP_ACCESS_SECRET` and server-side `WORKFLOWY_API_KEY`.

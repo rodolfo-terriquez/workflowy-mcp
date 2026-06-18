@@ -58,6 +58,22 @@ interface ActivityLog {
   timestamp: string;
 }
 
+interface ServerLog {
+  id: string | number;
+  level: LogType;
+  source: string;
+  event: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+  created_at: string;
+}
+
+interface ServerLogsPayload {
+  logs?: ServerLog[];
+  total_returned?: number;
+  error?: { message?: string } | string;
+}
+
 interface McpResponse<T = unknown> {
   result?: T;
   error?: { message?: string; code?: number } | string;
@@ -123,6 +139,14 @@ function formatTime(value: string): string {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+function formatLogMetadata(metadata: Record<string, unknown> | undefined): string {
+  if (!metadata || Object.keys(metadata).length === 0) {
+    return "";
+  }
+
+  return JSON.stringify(metadata);
 }
 
 function initParticleBackground(canvas: HTMLCanvasElement): () => void {
@@ -214,6 +238,7 @@ export default function Home() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
   const [activity, setActivity] = useState<ActivityLog[]>([]);
+  const [serverLogs, setServerLogs] = useState<ServerLog[]>([]);
   const [bookmarkName, setBookmarkName] = useState("");
   const [bookmarkNodeId, setBookmarkNodeId] = useState("");
   const [bookmarkContext, setBookmarkContext] = useState("");
@@ -290,6 +315,7 @@ export default function Home() {
         setBookmarks([]);
         setCacheStatus(null);
         setSearchResults([]);
+        setServerLogs([]);
         setAppMode("dashboard");
       }
       if (showLog) {
@@ -349,6 +375,7 @@ export default function Home() {
       setBookmarks([]);
       setCacheStatus(null);
       setSearchResults([]);
+      setServerLogs([]);
       setAppMode("dashboard");
       addLog("info", "Admin console locked.");
     } catch (error) {
@@ -418,6 +445,7 @@ export default function Home() {
       await refreshCacheStatus(false);
       await refreshBookmarks(false);
       await refreshMcpSettings(false);
+      await refreshServerLogs(false);
     } catch (error) {
       setConnectionStatus("failed");
       addLog("error", error instanceof Error ? error.message : String(error));
@@ -552,6 +580,59 @@ export default function Home() {
       (toolDescriptionDrafts[name] ?? defaultToolDescriptions[name]).trim() !==
       defaultToolDescriptions[name].trim()
     );
+  }
+
+  async function refreshServerLogs(showLog = true): Promise<void> {
+    try {
+      const response = await fetch("/api/admin/logs?limit=120", {
+        credentials: "same-origin",
+      });
+      const data = (await response.json()) as ServerLogsPayload;
+      if (!response.ok) {
+        const message =
+          typeof data.error === "string"
+            ? data.error
+            : data.error?.message || `HTTP ${response.status}`;
+        throw new Error(message);
+      }
+
+      setServerLogs(data.logs ?? []);
+      if (showLog) {
+        addLog("success", `Loaded ${data.logs?.length ?? 0} server logs.`);
+      }
+    } catch (error) {
+      if (showLog) {
+        addLog("error", error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
+
+  async function clearServerLogs(): Promise<void> {
+    setIsBusy(true);
+    try {
+      const response = await fetch("/api/admin/logs", {
+        method: "DELETE",
+        credentials: "same-origin",
+      });
+      const data = (await response.json()) as {
+        deleted_count?: number;
+        error?: { message?: string } | string;
+      };
+      if (!response.ok) {
+        const message =
+          typeof data.error === "string"
+            ? data.error
+            : data.error?.message || `HTTP ${response.status}`;
+        throw new Error(message);
+      }
+
+      setServerLogs([]);
+      addLog("success", `Cleared ${data.deleted_count ?? 0} server logs.`);
+    } catch (error) {
+      addLog("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsBusy(false);
+    }
   }
 
   async function refreshBookmarks(showLog = true): Promise<void> {
@@ -1106,10 +1187,42 @@ export default function Home() {
 
           {activeSection === "diagnostics" && (
             <>
-              <Header title="Diagnostics" subtitle="Recent browser-side checks and MCP calls." />
+              <Header title="Diagnostics" subtitle="Server-side MCP logs and recent browser-side checks." />
+              <div className={styles.sectionHeaderRow}>
+                <h2>Server Logs</h2>
+                <div className={styles.inlineActions}>
+                  <button className={styles.secondaryButton} onClick={() => refreshServerLogs()} disabled={isBusy || !isAuthenticated} type="button">
+                    Refresh
+                  </button>
+                  <button className={styles.dangerButtonSmall} onClick={clearServerLogs} disabled={isBusy || !serverLogs.length} type="button">
+                    Clear Server Logs
+                  </button>
+                </div>
+              </div>
+              <div className={styles.logContainer}>
+                {serverLogs.length === 0 ? (
+                  <div className={styles.logEntry}>No server logs yet.</div>
+                ) : (
+                  serverLogs.map((entry) => (
+                    <div key={entry.id} className={`${styles.logEntry} ${styles[entry.level]}`}>
+                      [{formatTime(entry.created_at)}] {entry.event}: {entry.message}
+                      {formatLogMetadata(entry.metadata) && (
+                        <code>{formatLogMetadata(entry.metadata)}</code>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className={styles.sectionHeaderRow}>
+                <h2>Browser Activity</h2>
+                <button className={styles.secondaryButton} onClick={() => setActivity([])} type="button">
+                  Clear Activity
+                </button>
+              </div>
               <div className={styles.logContainer}>
                 {activity.length === 0 ? (
-                  <div className={styles.logEntry}>No activity yet.</div>
+                  <div className={styles.logEntry}>No browser activity yet.</div>
                 ) : (
                   activity.map((entry) => (
                     <div key={entry.id} className={`${styles.logEntry} ${styles[entry.type]}`}>
@@ -1119,8 +1232,12 @@ export default function Home() {
                 )}
               </div>
               <div className={styles.buttonRow}>
-                <button className={styles.secondaryButton} onClick={() => setActivity([])} type="button">
-                  Clear Logs
+                <button className={styles.secondaryButton} onClick={() => {
+                  void refreshAdminSession();
+                  void refreshCacheStatus(false);
+                  void refreshServerLogs(false);
+                }} disabled={isBusy} type="button">
+                  Refresh Diagnostics
                 </button>
               </div>
             </>

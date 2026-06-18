@@ -367,6 +367,14 @@
   letter-spacing: 0;
 }
 
+.inlineActions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .toolEditorList {
   display: grid;
   gap: 8px;
@@ -680,6 +688,14 @@
   font-size: 12px;
   line-height: 1.45;
   border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.logEntry code {
+  display: block;
+  margin-top: 3px;
+  color: rgba(224, 224, 224, 0.8);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .success {

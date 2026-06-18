@@ -33,6 +33,7 @@ const INSERT_CHUNK_SIZE = 500;
 
 type SqlClient = NeonQueryFunction<false, false>;
 type ToolResponse = { content: Array<{ type: "text"; text: string }> };
+type McpLogLevel = "info" | "success" | "warning" | "error";
 
 interface WorkflowyExportNode {
   id: string;
@@ -67,6 +68,14 @@ interface CachedNodeRow {
 interface McpSettings {
   server_instructions: string | null;
   tool_descriptions: Partial<Record<McpToolName, string>>;
+}
+
+interface McpLogInput {
+  accountKey: string;
+  level: McpLogLevel;
+  event: string;
+  message: string;
+  metadata?: Record<string, unknown>;
 }
 
 let dbPromise: Promise<SqlClient> | undefined;
@@ -129,6 +138,18 @@ async function getDb(): Promise<SqlClient> {
       )
     `;
     await sql`
+      CREATE TABLE IF NOT EXISTS workflowy_mcp_logs (
+        id BIGSERIAL PRIMARY KEY,
+        account_key TEXT NOT NULL,
+        level TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'mcp',
+        event TEXT NOT NULL,
+        message TEXT NOT NULL,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`
       CREATE INDEX IF NOT EXISTS idx_workflowy_nodes_parent
       ON workflowy_nodes (account_key, parent_id, priority)
     `;
@@ -140,6 +161,10 @@ async function getDb(): Promise<SqlClient> {
       CREATE INDEX IF NOT EXISTS idx_workflowy_nodes_search
       ON workflowy_nodes
       USING GIN (to_tsvector('simple', coalesce(name, '') || ' ' || coalesce(note, '')))
+    `;
+    await sql`
+      CREATE INDEX IF NOT EXISTS idx_workflowy_mcp_logs_account_created
+      ON workflowy_mcp_logs (account_key, created_at DESC)
     `;
 
     return sql;
@@ -184,6 +209,139 @@ function getApiKey(extra: { authInfo?: AuthInfo }): string {
 
 function accountKeyFromApiKey(apiKey: string): string {
   return createHash("sha256").update(apiKey).digest("hex");
+}
+
+function safeLogValue(value: unknown, depth = 0): unknown {
+  if (depth > 3) {
+    return "[truncated]";
+  }
+
+  if (typeof value === "string") {
+    return value.length > 240 ? `${value.slice(0, 240)}...` : value;
+  }
+
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    value === null ||
+    value === undefined
+  ) {
+    return value ?? null;
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 12).map((item) => safeLogValue(item, depth + 1));
+  }
+
+  if (isRecord(value)) {
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, childValue] of Object.entries(value)) {
+      if (/authorization|secret|token|api[_-]?key|password|credential/i.test(key)) {
+        sanitized[key] = "[redacted]";
+        continue;
+      }
+      sanitized[key] = safeLogValue(childValue, depth + 1);
+    }
+    return sanitized;
+  }
+
+  return String(value);
+}
+
+function safeLogMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  return (safeLogValue(metadata ?? {}) ?? {}) as Record<string, unknown>;
+}
+
+async function writeMcpLog({
+  accountKey,
+  level,
+  event,
+  message,
+  metadata,
+}: McpLogInput): Promise<void> {
+  try {
+    const sql = await getDb();
+    await sql`
+      INSERT INTO workflowy_mcp_logs (
+        account_key,
+        level,
+        source,
+        event,
+        message,
+        metadata
+      )
+      VALUES (
+        ${accountKey},
+        ${level},
+        'mcp',
+        ${event},
+        ${message},
+        ${JSON.stringify(safeLogMetadata(metadata))}::jsonb
+      )
+    `;
+  } catch {
+    // Logging must never break MCP tool calls.
+  }
+}
+
+function responseHasError(response: ToolResponse): boolean {
+  const text = response.content.find((item) => item.type === "text")?.text;
+  if (!text || !/(^|\{|,)\s*"error"\s*:|(^|\{|,)\s*"success"\s*:\s*false/.test(text)) {
+    return false;
+  }
+
+  const payload = parseJsonContent(response);
+  return Boolean(
+    isRecord(payload) &&
+      (payload.error === true ||
+        payload.success === false ||
+        typeof payload.error === "string" ||
+        isRecord(payload.error)),
+  );
+}
+
+async function loggedToolCall(
+  extra: { authInfo?: AuthInfo },
+  toolName: McpToolName,
+  metadata: Record<string, unknown>,
+  run: (apiKey: string, accountKey: string) => Promise<ToolResponse>,
+): Promise<ToolResponse> {
+  const apiKey = getApiKey(extra);
+  const accountKey = accountKeyFromApiKey(apiKey);
+  const startedAt = Date.now();
+
+  try {
+    const response = await run(apiKey, accountKey);
+    const hasError = responseHasError(response);
+    await writeMcpLog({
+      accountKey,
+      level: hasError ? "warning" : "success",
+      event: `tool.${toolName}`,
+      message: hasError
+        ? `${toolName} completed with tool-level error`
+        : `${toolName} completed`,
+      metadata: {
+        ...metadata,
+        duration_ms: Date.now() - startedAt,
+      },
+    });
+    return response;
+  } catch (error) {
+    await writeMcpLog({
+      accountKey,
+      level: "error",
+      event: `tool.${toolName}`,
+      message: `${toolName} failed`,
+      metadata: {
+        ...metadata,
+        duration_ms: Date.now() - startedAt,
+        error: errorMessage(error),
+      },
+    });
+    throw error;
+  }
 }
 
 async function getMcpSettings(
@@ -1378,34 +1536,34 @@ const handler = createMcpHandler(
       DEFAULT_TOOL_DESCRIPTIONS.list_bookmarks,
       {},
       async (_args, extra) => {
-        const apiKey = getApiKey(extra);
-        const accountKey = accountKeyFromApiKey(apiKey);
-        const sql = await getDb();
-        const bookmarks = await sql`
-          SELECT name, node_id, context, created_at, updated_at
-          FROM workflowy_bookmarks
-          WHERE account_key = ${accountKey}
-          ORDER BY name
-        `;
-        const aiInstructionsBookmark = bookmarks.find(
-          (bookmark) => bookmark.name === AI_INSTRUCTIONS_BOOKMARK,
-        );
-        const userInstructions = aiInstructionsBookmark
-          ? await readUserInstructions(apiKey, String(aiInstructionsBookmark.node_id))
-          : undefined;
+        return loggedToolCall(extra, "list_bookmarks", {}, async (apiKey, accountKey) => {
+          const sql = await getDb();
+          const bookmarks = await sql`
+            SELECT name, node_id, context, created_at, updated_at
+            FROM workflowy_bookmarks
+            WHERE account_key = ${accountKey}
+            ORDER BY name
+          `;
+          const aiInstructionsBookmark = bookmarks.find(
+            (bookmark) => bookmark.name === AI_INSTRUCTIONS_BOOKMARK,
+          );
+          const userInstructions = aiInstructionsBookmark
+            ? await readUserInstructions(apiKey, String(aiInstructionsBookmark.node_id))
+            : undefined;
 
-        return jsonContent({
-          _instructions:
-            "READ THIS FIRST: Use user_instructions for this conversation when present. Use bookmark node_ids directly with read_doc.",
-          account: {
-            id: accountKey.slice(0, 12),
-            storage: "remote-neon",
-          },
-          bookmarks,
-          user_instructions: userInstructions,
-          action_required: aiInstructionsBookmark
-            ? undefined
-            : `No ${AI_INSTRUCTIONS_BOOKMARK} bookmark found. If the user has an AI Instructions node, read it and save it with save_bookmark using name "${AI_INSTRUCTIONS_BOOKMARK}".`,
+          return jsonContent({
+            _instructions:
+              "READ THIS FIRST: Use user_instructions for this conversation when present. Use bookmark node_ids directly with read_doc.",
+            account: {
+              id: accountKey.slice(0, 12),
+              storage: "remote-neon",
+            },
+            bookmarks,
+            user_instructions: userInstructions,
+            action_required: aiInstructionsBookmark
+              ? undefined
+              : `No ${AI_INSTRUCTIONS_BOOKMARK} bookmark found. If the user has an AI Instructions node, read it and save it with save_bookmark using name "${AI_INSTRUCTIONS_BOOKMARK}".`,
+          });
         });
       },
     );
@@ -1435,26 +1593,35 @@ const handler = createMcpHandler(
         }: { name: string; node_id: string; context?: string },
         extra,
       ) => {
-        const apiKey = getApiKey(extra);
-        const accountKey = accountKeyFromApiKey(apiKey);
-        const sql = await getDb();
         const normalizedNodeId = normalizeNodeId(node_id);
         const normalizedContext = context?.trim() || null;
 
-        await sql`
-          INSERT INTO workflowy_bookmarks (account_key, name, node_id, context)
-          VALUES (${accountKey}, ${name}, ${normalizedNodeId}, ${normalizedContext})
-          ON CONFLICT (account_key, name)
-          DO UPDATE SET
-            node_id = EXCLUDED.node_id,
-            context = EXCLUDED.context,
-            updated_at = NOW()
-        `;
+        return loggedToolCall(
+          extra,
+          "save_bookmark",
+          {
+            bookmark_name: name,
+            node_id: normalizedNodeId,
+            has_context: Boolean(normalizedContext),
+          },
+          async (_apiKey, accountKey) => {
+            const sql = await getDb();
+            await sql`
+              INSERT INTO workflowy_bookmarks (account_key, name, node_id, context)
+              VALUES (${accountKey}, ${name}, ${normalizedNodeId}, ${normalizedContext})
+              ON CONFLICT (account_key, name)
+              DO UPDATE SET
+                node_id = EXCLUDED.node_id,
+                context = EXCLUDED.context,
+                updated_at = NOW()
+            `;
 
-        return textContent(
-          `Bookmark "${name}" saved with node ID: ${normalizedNodeId}${
-            normalizedContext ? ` and context: "${normalizedContext}"` : ""
-          }`,
+            return textContent(
+              `Bookmark "${name}" saved with node ID: ${normalizedNodeId}${
+                normalizedContext ? ` and context: "${normalizedContext}"` : ""
+              }`,
+            );
+          },
         );
       },
     );
@@ -1466,20 +1633,25 @@ const handler = createMcpHandler(
         name: z.string().min(1).describe("The bookmark name to delete"),
       },
       async ({ name }: { name: string }, extra) => {
-        const apiKey = getApiKey(extra);
-        const accountKey = accountKeyFromApiKey(apiKey);
-        const sql = await getDb();
-        const deleted = await sql`
-          DELETE FROM workflowy_bookmarks
-          WHERE account_key = ${accountKey} AND name = ${name}
-          RETURNING name
-        `;
+        return loggedToolCall(
+          extra,
+          "delete_bookmark",
+          { bookmark_name: name },
+          async (_apiKey, accountKey) => {
+            const sql = await getDb();
+            const deleted = await sql`
+              DELETE FROM workflowy_bookmarks
+              WHERE account_key = ${accountKey} AND name = ${name}
+              RETURNING name
+            `;
 
-        if (deleted.length === 0) {
-          return textContent(`Bookmark "${name}" not found`);
-        }
+            if (deleted.length === 0) {
+              return textContent(`Bookmark "${name}" not found`);
+            }
 
-        return textContent(`Bookmark "${name}" deleted`);
+            return textContent(`Bookmark "${name}" deleted`);
+          },
+        );
       },
     );
 
@@ -1501,7 +1673,15 @@ const handler = createMcpHandler(
       async (
         { node_id, depth }: { node_id: string; depth?: number },
         extra,
-      ) => llmDocRead(getApiKey(extra), node_id, depth),
+      ) => loggedToolCall(
+        extra,
+        "read_doc",
+        {
+          node_id: normalizeNodeId(node_id),
+          depth: clampDepth(depth),
+        },
+        async (apiKey) => llmDocRead(apiKey, node_id, depth),
+      ),
     );
 
     registeredTools.edit_doc = server.tool(
@@ -1524,25 +1704,34 @@ const handler = createMcpHandler(
         }: { root: string; operations: LlmDocOperation[] },
         extra,
       ) => {
-        const apiKey = getApiKey(extra);
-        const accountKey = accountKeyFromApiKey(apiKey);
-        const editResponse = await llmDocEdit(apiKey, root, operations);
-        const payload = parseJsonContent(editResponse);
+        return loggedToolCall(
+          extra,
+          "edit_doc",
+          {
+            root: normalizeNodeId(root),
+            operation_count: operations.length,
+            operation_types: operations.map((operation) => operation.op),
+          },
+          async (apiKey, accountKey) => {
+            const editResponse = await llmDocEdit(apiKey, root, operations);
+            const payload = parseJsonContent(editResponse);
 
-        if (isRecord(payload) && payload.success === true) {
-          const cacheRefresh = await refreshCacheAfterEdit(
-            apiKey,
-            accountKey,
-            root,
-            operations,
-          );
-          return jsonContent({
-            ...payload,
-            cache_refresh: cacheRefresh,
-          });
-        }
+            if (isRecord(payload) && payload.success === true) {
+              const cacheRefresh = await refreshCacheAfterEdit(
+                apiKey,
+                accountKey,
+                root,
+                operations,
+              );
+              return jsonContent({
+                ...payload,
+                cache_refresh: cacheRefresh,
+              });
+            }
 
-        return editResponse;
+            return editResponse;
+          },
+        );
       },
     );
 
@@ -1568,25 +1757,34 @@ const handler = createMcpHandler(
         }: { query: string; include_completed?: boolean; limit?: number },
         extra,
       ) => {
-        const apiKey = getApiKey(extra);
-        const accountKey = accountKeyFromApiKey(apiKey);
         const safeLimit = Math.min(Math.max(Math.trunc(limit ?? 10), 1), 100);
-        const result = await searchCachedNodes({
-          apiKey,
-          accountKey,
-          query,
-          includeCompleted: include_completed ?? false,
-          limit: safeLimit,
-        });
+        return loggedToolCall(
+          extra,
+          "search_nodes",
+          {
+            query_length: query.trim().length,
+            include_completed: include_completed ?? false,
+            limit: safeLimit,
+          },
+          async (apiKey, accountKey) => {
+            const result = await searchCachedNodes({
+              apiKey,
+              accountKey,
+              query,
+              includeCompleted: include_completed ?? false,
+              limit: safeLimit,
+            });
 
-        return jsonContent({
-          query,
-          results: result.results,
-          total_found: result.results.length,
-          cache_status: result.cache_status,
-          auto_sync: result.auto_sync,
-          error: result.error,
-        });
+            return jsonContent({
+              query,
+              results: result.results,
+              total_found: result.results.length,
+              cache_status: result.cache_status,
+              auto_sync: result.auto_sync,
+              error: result.error,
+            });
+          },
+        );
       },
     );
 
@@ -1595,9 +1793,9 @@ const handler = createMcpHandler(
       DEFAULT_TOOL_DESCRIPTIONS.sync_nodes,
       {},
       async (_args, extra) => {
-        const apiKey = getApiKey(extra);
-        const accountKey = accountKeyFromApiKey(apiKey);
-        return jsonContent(await performFullSync(apiKey, accountKey));
+        return loggedToolCall(extra, "sync_nodes", {}, async (apiKey, accountKey) =>
+          jsonContent(await performFullSync(apiKey, accountKey)),
+        );
       },
     );
 
@@ -1606,10 +1804,10 @@ const handler = createMcpHandler(
       DEFAULT_TOOL_DESCRIPTIONS.cache_status,
       {},
       async (_args, extra) => {
-        const apiKey = getApiKey(extra);
-        const accountKey = accountKeyFromApiKey(apiKey);
-        const sql = await getDb();
-        return jsonContent(await getCacheStatus(sql, accountKey));
+        return loggedToolCall(extra, "cache_status", {}, async (_apiKey, accountKey) => {
+          const sql = await getDb();
+          return jsonContent(await getCacheStatus(sql, accountKey));
+        });
       },
     );
 
@@ -1618,20 +1816,22 @@ const handler = createMcpHandler(
       DEFAULT_TOOL_DESCRIPTIONS.get_targets,
       {},
       async (_args, extra) => {
-        try {
-          const result = await workflowyJsonRequest(
-            getApiKey(extra),
-            `${WORKFLOWY_API_BASE}/api/v1/targets`,
-            { method: "GET" },
-          );
-          return jsonContent({
-            http_status: result.status,
-            ok: result.ok,
-            data: result.data,
-          });
-        } catch (error) {
-          return jsonContent({ error: true, message: errorMessage(error) });
-        }
+        return loggedToolCall(extra, "get_targets", {}, async (apiKey) => {
+          try {
+            const result = await workflowyJsonRequest(
+              apiKey,
+              `${WORKFLOWY_API_BASE}/api/v1/targets`,
+              { method: "GET" },
+            );
+            return jsonContent({
+              http_status: result.status,
+              ok: result.ok,
+              data: result.data,
+            });
+          } catch (error) {
+            return jsonContent({ error: true, message: errorMessage(error) });
+          }
+        });
       },
     );
 
@@ -1641,21 +1841,47 @@ const handler = createMcpHandler(
       async (extra) => {
         const apiKey = getApiKey(extra);
         const accountKey = accountKeyFromApiKey(apiKey);
+        const startedAt = Date.now();
 
-        await ensureCacheFresh(apiKey, accountKey).catch(() => undefined);
-
-        return {
-          description: "Server instructions for working with Workflowy",
-          messages: [
-            {
-              role: "user",
-              content: {
-                type: "text",
-                text: await buildServerInstructions(apiKey),
-              },
+        try {
+          await ensureCacheFresh(apiKey, accountKey).catch(() => undefined);
+          const instructions = await buildServerInstructions(apiKey);
+          await writeMcpLog({
+            accountKey,
+            level: "success",
+            event: "prompt.server_instructions",
+            message: "server_instructions prompt completed",
+            metadata: {
+              duration_ms: Date.now() - startedAt,
+              character_count: instructions.length,
             },
-          ],
-        };
+          });
+
+          return {
+            description: "Server instructions for working with Workflowy",
+            messages: [
+              {
+                role: "user",
+                content: {
+                  type: "text",
+                  text: instructions,
+                },
+              },
+            ],
+          };
+        } catch (error) {
+          await writeMcpLog({
+            accountKey,
+            level: "error",
+            event: "prompt.server_instructions",
+            message: "server_instructions prompt failed",
+            metadata: {
+              duration_ms: Date.now() - startedAt,
+              error: errorMessage(error),
+            },
+          });
+          throw error;
+        }
       },
     );
 
@@ -1674,30 +1900,58 @@ const handler = createMcpHandler(
 
     if (originalInitializeHandler) {
       server.server.setRequestHandler(InitializeRequestSchema, async (request, extra) => {
+        const apiKey = getApiKey(extra);
+        const accountKey = accountKeyFromApiKey(apiKey);
+        const startedAt = Date.now();
         try {
           updateServerInstructions(
             protocolServer,
-            await buildServerInstructions(getApiKey(extra)),
+            await buildServerInstructions(apiKey),
           );
         } catch {
           updateServerInstructions(protocolServer, DEFAULT_SERVER_INSTRUCTIONS);
         }
 
-        return (await originalInitializeHandler(request, extra)) as {
+        const result = (await originalInitializeHandler(request, extra)) as {
           protocolVersion: string;
           capabilities: unknown;
           serverInfo: unknown;
           instructions?: string;
         };
+        await writeMcpLog({
+          accountKey,
+          level: "success",
+          event: "mcp.initialize",
+          message: "MCP client initialized",
+          metadata: {
+            duration_ms: Date.now() - startedAt,
+            protocol_version: result.protocolVersion,
+          },
+        });
+        return result;
       });
     }
 
     if (originalListToolsHandler) {
       server.server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
-        await refreshRegisteredToolDescriptions(getApiKey(extra)).catch(() => undefined);
-        return (await originalListToolsHandler(request, extra)) as {
+        const apiKey = getApiKey(extra);
+        const accountKey = accountKeyFromApiKey(apiKey);
+        const startedAt = Date.now();
+        await refreshRegisteredToolDescriptions(apiKey).catch(() => undefined);
+        const result = (await originalListToolsHandler(request, extra)) as {
           tools: unknown[];
         };
+        await writeMcpLog({
+          accountKey,
+          level: "success",
+          event: "mcp.tools_list",
+          message: "MCP tools listed",
+          metadata: {
+            duration_ms: Date.now() - startedAt,
+            tool_count: result.tools.length,
+          },
+        });
+        return result;
       });
     }
 
