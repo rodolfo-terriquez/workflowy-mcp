@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import styles from "./page.module.css";
 
 type Section = "connection" | "setup" | "tools" | "bookmarks" | "cache" | "diagnostics";
@@ -106,7 +106,77 @@ function maskSecret(value: string): string {
   return `${value.slice(0, 4)}...${value.slice(-4)}`;
 }
 
+function initParticleBackground(canvas: HTMLCanvasElement): () => void {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    return () => {};
+  }
+  const context = ctx;
+
+  let frame = 0;
+  let width = 0;
+  let height = 0;
+  const spacing = 14;
+  const radius = 2.4;
+  const dots: Array<{ x: number; y: number; phase: number; speed: number }> = [];
+
+  function resize() {
+    const ratio = window.devicePixelRatio || 1;
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = Math.floor(width * ratio);
+    canvas.height = Math.floor(height * ratio);
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    dots.length = 0;
+
+    for (let x = spacing / 2; x < width; x += spacing) {
+      for (let y = spacing / 2; y < height; y += spacing) {
+        const edgeFade = Math.min(y, height - y, 260) / 260;
+        dots.push({
+          x,
+          y,
+          phase: Math.random() * Math.PI * 2,
+          speed: 0.004 + Math.random() * 0.006,
+        });
+        if (edgeFade < 0.08) {
+          dots[dots.length - 1].phase += 4;
+        }
+      }
+    }
+  }
+
+  function draw(time: number) {
+    context.fillStyle = "#1a1a2e";
+    context.fillRect(0, 0, width, height);
+
+    for (const dot of dots) {
+      const edgeFade = Math.min(dot.y, height - dot.y, 300) / 300;
+      const pulse = (Math.sin(time * dot.speed + dot.phase) + 1) / 2;
+      const alpha = 0.12 + pulse * 0.26 * edgeFade;
+      context.fillStyle = `rgba(165, 168, 252, ${alpha})`;
+      context.beginPath();
+      context.arc(dot.x, dot.y, radius, 0, Math.PI * 2);
+      context.fill();
+    }
+
+    frame = window.requestAnimationFrame(draw);
+  }
+
+  resize();
+  window.addEventListener("resize", resize);
+  frame = window.requestAnimationFrame(draw);
+
+  return () => {
+    window.cancelAnimationFrame(frame);
+    window.removeEventListener("resize", resize);
+  };
+}
+
 export default function Home() {
+  const particleCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [appMode, setAppMode] = useState<"dashboard" | "settings">("dashboard");
   const [activeSection, setActiveSection] = useState<Section>("connection");
   const [setupTab, setSetupTab] = useState<SetupTab>("claude");
   const [endpoint, setEndpoint] = useState("");
@@ -142,6 +212,13 @@ export default function Home() {
         window.localStorage.removeItem(STORAGE_KEY);
       }
     }
+  }, []);
+
+  useEffect(() => {
+    if (!particleCanvasRef.current) {
+      return;
+    }
+    return initParticleBackground(particleCanvasRef.current);
   }, []);
 
   const authToken = useMemo(
@@ -393,10 +470,84 @@ export default function Home() {
             2,
           );
 
+  const connectionText =
+    connectionStatus === "connected"
+      ? "Remote MCP connected"
+      : canCallMcp
+        ? "Ready to test connection"
+        : "Connection not configured";
+
   return (
+    <>
+      <canvas ref={particleCanvasRef} className={styles.particleCanvas} />
+
+      {appMode === "dashboard" && (
+        <main className={styles.dashboardWrapper}>
+          <section className={styles.dashboardCard}>
+            <div className={styles.dashboardHeader}>
+              <img src="/wf-mcp.png" alt="" className={styles.dashboardLogo} />
+              <h1>Workflowy MCP</h1>
+            </div>
+
+            <div className={styles.dashboardStatus}>
+              <span className={`${styles.dashboardStatusDot} ${styles[connectionStatus]}`} />
+              <span className={styles.dashboardStatusText}>{connectionText}</span>
+            </div>
+
+            <div className={styles.dashboardInfoGrid}>
+              <div className={styles.dashboardInfoItem}>
+                <span className={styles.dashboardInfoLabel}>Endpoint</span>
+                <span className={styles.dashboardInfoValue}>
+                  {endpoint ? "Configured" : "Missing"}
+                </span>
+              </div>
+              <div className={styles.dashboardInfoItem}>
+                <span className={styles.dashboardInfoLabel}>Cache</span>
+                <span className={styles.dashboardInfoValue}>
+                  {cacheStatus
+                    ? `${cacheStatus.node_count.toLocaleString()} nodes`
+                    : "Not checked"}
+                </span>
+              </div>
+              <div className={`${styles.dashboardInfoItem} ${styles.dashboardInfoFull}`}>
+                <span className={styles.dashboardInfoLabel}>Credentials</span>
+                <span className={styles.dashboardInfoValue}>
+                  {canCallMcp ? "Stored in this browser session" : "Add in settings"}
+                </span>
+              </div>
+            </div>
+
+            <button
+              className={styles.dashboardSettingsButton}
+              onClick={() => setAppMode("settings")}
+              type="button"
+            >
+              Edit Settings
+            </button>
+          </section>
+
+          <a
+            className={styles.dashboardGithubLink}
+            href="https://github.com/rodolfo-terriquez/workflowy-mcp"
+            target="_blank"
+            rel="noreferrer"
+          >
+            GitHub
+          </a>
+        </main>
+      )}
+
+      {appMode === "settings" && (
     <main className={styles.appLayout}>
       <aside className={styles.sidebar}>
         <div className={styles.sidebarHeader}>
+          <button
+            className={styles.sidebarBackButton}
+            onClick={() => setAppMode("dashboard")}
+            type="button"
+          >
+            ← Back to Dashboard
+          </button>
           <img src="/wf-mcp.png" alt="" className={styles.logo} />
           <div>
             <h1>Workflowy MCP</h1>
@@ -646,6 +797,8 @@ export default function Home() {
         </div>
       </section>
     </main>
+      )}
+    </>
   );
 }
 
